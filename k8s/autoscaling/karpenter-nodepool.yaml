@@ -1,0 +1,77 @@
+# Illustrative example: scaling the GPU pool from zero with Karpenter.
+#
+# This is NOT wired into model-server.yaml by default -- it's a worked example
+# of the piece this repo's README calls out as missing (the NodeGroup/ASG
+# exists; nothing adds a node when a request arrives at a scaled-to-zero
+# pool). Adapt the instance requirements and taints to your own node pool
+# naming.
+#
+# Karpenter watches for Pending pods it can satisfy and provisions a node
+# on demand; when nodes go idle past `consolidateAfter`, it terminates them,
+# returning the pool to zero. This replaces a fixed-size ASG managed node
+# group for the accelerator pool specifically -- the CPU "system" pool can
+# stay a normal managed node group.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-inference
+spec:
+  template:
+    metadata:
+      labels:
+        inference.io/pool: gpu-inference
+    spec:
+      taints:
+        - key: inference.io/accelerator
+          value: "true"
+          effect: NoSchedule
+      requirements:
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["g5", "g6e"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-inference
+      expireAfter: 720h
+  limits:
+    cpu: "32"
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    # How long an idle GPU node sits before Karpenter reclaims it. Shorter
+    # means faster return to $0; longer means fewer cold starts if requests
+    # are bursty with short gaps. Tune against your own traffic shape --
+    # the article this repo accompanies discusses sizing this against a
+    # school-day traffic pattern.
+    consolidateAfter: 5m
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-inference
+spec:
+  amiFamily: AL2023
+  amiSelectorTerms:
+    - alias: al2023@latest
+      # NVIDIA-enabled AMI variant. A STANDARD AMI here joins the cluster fine
+      # and then never advertises nvidia.com/gpu -- a mysterious scheduling
+      # failure, not an obvious AMI mistake.
+  role: "KarpenterNodeRole-example"
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "example-cluster"
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: "example-cluster"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 200Gi
+        volumeType: gp3
+        encrypted: true

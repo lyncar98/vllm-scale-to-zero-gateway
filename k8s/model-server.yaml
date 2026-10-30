@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-server
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: model-server
+spec:
+  # One replica. Each replica holds a full copy of the weights in VRAM, so
+  # scaling out means another whole GPU node -- horizontal scaling here is a
+  # cost decision, not a reflex. vLLM's continuous batching already keeps a
+  # single GPU busy across many concurrent requests, which is the cheaper axis
+  # to exploit first.
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate. A rolling update would try to schedule a
+    # second GPU pod before terminating the first; on a one-GPU-per-replica
+    # deployment that doubles GPU spend for the duration of every rollout, and
+    # can fail outright if quota allows only one node. Recreate accepts a
+    # short gap instead -- acceptable because the gateway already surfaces
+    # warming as a first-class state.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: model-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: model-server
+    spec:
+      serviceAccountName: model-server
+      # Land on the GPU pool. BOTH of these are required:
+      #   - nodeSelector picks the accelerator pool.
+      #   - tolerations get past the inference.io/accelerator taint that stops
+      #     ordinary workloads from landing on expensive GPU nodes.
+      # Omitting the toleration leaves the pod Pending forever with a
+      # taint-mismatch event; omitting the selector lets it land on the cheap
+      # CPU pool where there is no GPU and vLLM fails at startup.
+      nodeSelector:
+        inference.io/pool: gpu-inference
+      tolerations:
+        - key: inference.io/accelerator
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      # Give the scheduler room to trigger a scale-up from zero rather than
+      # failing fast when no GPU node exists yet.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: vllm
+          image: ghcr.io/example/model-server:v0.1.0
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: MAX_MODEL_LEN
+              # Well under the model's theoretical maximum: KV cache is the
+              # binding constraint on a 24GB GPU, so a larger window trades
+              # away concurrency. Raise deliberately, with a load test.
+              value: "8192"
+            - name: GPU_MEMORY_UTILIZATION
+              # Headroom so a burst of long prompts does not OOM the worker.
+              value: "0.90"
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+            requests:
+              nvidia.com/gpu: "1"
+              cpu: "2"
+              memory: 12Gi
+          # Loading many GB of weights into VRAM takes minutes. A startupProbe
+          # (rather than a long initialDelaySeconds on readiness) lets the
+          # liveness probe stay aggressive once running while still tolerating
+          # a slow boot: 60 * 10s = up to 10 minutes to become ready.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: false # vLLM's official image runs as root; harden if your base image allows it
+            capabilities:
+              drop: ["ALL"]
+      volumes: []
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-server
+  namespace: inference
+spec:
+  # ClusterIP, not LoadBalancer. The model server is never directly reachable
+  # from outside the cluster -- only the gateway talks to it.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: model-server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-server
+  namespace: inference
+  annotations:
+    # IRSA (or equivalent workload-identity) role. Grants object-storage read
+    # only if/when the model server needs to pull checkpoints at runtime
+    # instead of (or in addition to) the baked-in weights.
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/inference-model-server

@@ -1,0 +1,49 @@
+# Illustrative example: scaling the model-server Deployment itself (0 -> 1,
+# or 1 -> N) off vLLM's own queue depth, using KEDA.
+#
+# Why queue depth and not CPU/GPU utilization: a GPU at 100% SM utilization
+# serving one slow request and a GPU at 100% utilization serving a healthy
+# batch of fast ones look identical to a utilization-based HPA. vLLM exposes
+# `vllm:num_requests_waiting` on its /metrics endpoint specifically to answer
+# "is work backing up," which is the signal that should trigger scaling.
+#
+# This ScaledObject is what turns a Pending pod (from scaling the Deployment
+# off zero) into a trigger Karpenter can see and act on -- see
+# karpenter-nodepool.yaml for the node side of scale-from-zero.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: model-server
+  namespace: inference
+spec:
+  scaleTargetRef:
+    name: model-server
+  # Replicas sit at 0 when idle. minReplicaCount: 0 is what makes this
+  # scale-*from*-zero rather than just autoscaling a floor of 1 -- combined
+  # with Karpenter's consolidation, an idle pool costs nothing.
+  minReplicaCount: 0
+  maxReplicaCount: 4
+  # How long an idle (empty-queue) deployment waits before scaling to zero.
+  # Set above your p95 gap between requests during business hours, or you'll
+  # pay a cold start on every lull.
+  cooldownPeriod: 300
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: http://prometheus.monitoring.svc:9090
+        metricName: vllm_num_requests_waiting
+        # vLLM's own queue-depth metric. A nonzero value means requests are
+        # queued behind the running batch -- the signal to add capacity.
+        query: sum(vllm:num_requests_waiting{service="model-server"})
+        threshold: "1"
+    - type: cron
+      metadata:
+        # Optional warm floor during known-busy hours, matching a traffic
+        # pattern that follows a predictable daily/weekly shape (e.g. a
+        # school day in a single time zone). Keeping one replica warm during
+        # these hours trades a small fixed cost for removing cold starts when
+        # they'd otherwise hurt the most.
+        timezone: America/Santiago
+        start: "0 8 * * 1-5"
+        end: "0 20 * * 1-5"
+        desiredReplicas: "1"

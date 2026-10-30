@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-gateway
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: inference-gateway
+spec:
+  # Two replicas on the cheap CPU pool. The gateway is the always-on front
+  # door: it must stay up while the GPU pool is scaled to zero, so that a
+  # request arriving cold gets a "warming" answer from a live service rather
+  # than a connection refused.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: inference-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: inference-gateway
+    spec:
+      # Explicitly the system (CPU) pool. No GPU toleration, so this can never
+      # accidentally occupy an accelerator node.
+      nodeSelector:
+        inference.io/pool: system
+      containers:
+        - name: gateway
+          image: ghcr.io/example/inference-gateway:v0.1.0
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: GATEWAY_MODEL_SERVER_URL
+              value: http://model-server:8000
+            - name: GATEWAY_GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: inference-gateway
+                  key: gateway_api_key
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          # Liveness deliberately hits /healthz (process-only) while readiness
+          # hits /readyz (checks the upstream). If liveness checked the
+          # upstream, a scaled-to-zero GPU pool would get the gateway itself
+          # killed and restarted in a loop -- exactly when it is most needed
+          # to report warming.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-gateway
+  namespace: inference
+  annotations:
+    # INTERNAL load balancer. This is the load-bearing annotation: the
+    # gateway is private by default. Flipping this to internet-facing would
+    # expose a GPU-backed endpoint directly, bypassing whatever auth, quota
+    # and usage metering fronts it today. Treat edits to this annotation as a
+    # security review.
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: inference-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+# Example secret shape. In a real cluster this is synced from a secrets
+# manager (e.g. External Secrets Operator), not committed -- this file exists
+# so `kubectl apply -k .` works out of the box for local experimentation.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: inference-gateway
+  namespace: inference
+type: Opaque
+stringData:
+  gateway_api_key: "replace-me"

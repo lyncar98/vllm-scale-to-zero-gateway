@@ -1,0 +1,17 @@
+environment = "prod"
+aws_region  = "us-east-2"
+cluster_version = "1.31"
+
+# Fill in with your own VPC/subnet IDs, or wire a `data` source / remote
+# state lookup against whatever stack owns your networking.
+vpc_id              = "vpc-REPLACE_ME"
+private_subnet_ids  = ["subnet-REPLACE_ME_A", "subnet-REPLACE_ME_B"]
+public_subnet_ids   = []
+
+# Scope to the VPC(s) that front the gateway (a BFF, an API layer, a VPN).
+inference_consumer_cidrs = ["10.0.0.0/16"]
+
+# Cross-account / external model artifact reads stay empty until you have a
+# checkpoint stored outside the image. Baking weights into the image (see
+# ../model-server/Dockerfile) needs no S3 access at all.
+model_read_bucket_arns = []
