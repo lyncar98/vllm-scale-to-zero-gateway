@@ -26,15 +26,18 @@ ARG MODEL_REPO=Qwen/Qwen3-8B
 # MODEL_REVISION must be a full commit SHA in any environment you care about.
 # "main" is a mutable branch pointer: two builds a week apart can produce
 # different weights behind an identical image tag, which breaks the audit
-# property this whole design exists to provide.
+# property this whole design exists to provide. The build fails below if
+# this is still "main" -- pass a real SHA with --build-arg.
 #
 # Resolve the current SHA with:
 #   curl -s https://huggingface.co/api/models/Qwen/Qwen3-8B | jq -r .sha
-#
-# It is left as "main" here only so a fresh clone builds without extra setup;
-# wire your CI to pass an explicit SHA instead (fail the build if it's still
-# this placeholder).
 ARG MODEL_REVISION=main
+RUN if [ "$MODEL_REVISION" = "main" ]; then \
+      echo "MODEL_REVISION is still 'main'. Pass a pinned commit SHA:" >&2; \
+      echo "  docker build --build-arg MODEL_REVISION=<sha> ..." >&2; \
+      echo "A mutable branch pointer breaks the audit property this design exists to provide." >&2; \
+      exit 1; \
+    fi
 
 ENV PIP_NO_CACHE_DIR=1 HF_HUB_DISABLE_TELEMETRY=1
 RUN pip install "huggingface_hub[hf_transfer]==0.26.2"
@@ -67,9 +70,13 @@ snapshot_download( \
 # ---------------------------------------------------------------------------
 # vLLM's official image already carries CUDA, PyTorch and the OpenAI-compatible
 # server. Pin to a current release that supports your target model family --
-# v0.6.4 predates Qwen3, for example. Pinned by tag (not :latest) so a rebuild
-# is reproducible.
-FROM vllm/vllm-openai:v0.6.6
+# Qwen3 support landed in v0.8.4 (github.com/vllm-project/vllm/pull/15289);
+# v0.8.5 is the release vLLM's own notes call "day 0 support for Qwen3,"
+# fixing FP8 weight loading and adding tuned MoE configs, so it's the floor
+# here rather than v0.8.4. Pinned by tag (not :latest) so a rebuild is
+# reproducible -- re-check this against your actual target model before
+# reusing it for something newer.
+FROM vllm/vllm-openai:v0.8.5
 
 # vLLM's entrypoint is the OpenAI-compatible API server. Override it only to
 # supply our own defaults; the flags stay overridable from the Helm values so

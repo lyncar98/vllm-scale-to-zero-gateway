@@ -10,8 +10,8 @@ shape of infrastructure built for a real teaching-assistant agent (ChatLPO /
 Lautum) under the **AWS Startups Custom-Model Inference Program**, extracted
 to be useful on its own. See the companion article, *"Before Our First
 Token: Designing Self-Hosted Inference for an Agent That Plans a School
-Year,"* for the reasoning behind these choices and the measurements that are
-still in progress.
+Year"* <!-- TODO: replace with the live Medium URL --> for the reasoning
+behind these choices and the measurements that are still in progress.
 
 ```
 caller ──▶ [internal NLB] ──▶ inference gateway ──▶ vLLM model server (GPU, scale-to-zero)
@@ -66,7 +66,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 # refuses to boot if auth is required but no key is set.
 GATEWAY_REQUIRE_AUTH=false .venv/bin/uvicorn app.main:app --port 8080
 
-.venv/bin/pytest -q   # ~25 tests, no GPU or network needed
+.venv/bin/pytest -q   # 36 tests, no GPU or network needed
 ```
 
 ## Deploying the whole stack
