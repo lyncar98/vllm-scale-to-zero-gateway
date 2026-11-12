@@ -10,9 +10,11 @@ inference semantics. It owns exactly four things vLLM does not:
      first request after idle arrives while no GPU node exists. A naive proxy
      surfaces that as a timeout; this surfaces 503 + Retry-After so the caller
      can show "warming up" instead of "error".
-  3. Readiness that reflects the *upstream*, not this process. A gateway pod
-     that is up while vLLM is still loading weights must not report ready, or
-     the Service will route traffic into a 503.
+  3. Distinct readiness and liveness contracts. The gateway exposes /healthz
+     (process health) and /readyz (upstream model server availability). In
+     Kubernetes, the gateway's readiness probe must remain decoupled from
+     upstream existence so the gateway remains routable to serve 503 warming
+     responses when the GPU pool is at zero replicas.
   4. Usage telemetry stripped of content. Token counts come from the
      upstream's own usage field, recorded with the served model name. Prompts
      and completions are never logged by this process.
@@ -24,7 +26,7 @@ passthrough.
 
 This is a standalone reference implementation: the pattern behind a serving
 gateway described in "Before Our First Token" (the ChatLPO / AWS Startups
-Custom-Model Inference Program series). See the repo README for the article
+Custom-Model Inference Fellowship series). See the repo README for the article
 link and for what's deliberately out of scope here.
 """
 
@@ -194,9 +196,15 @@ async def healthz() -> dict[str, str]:
 async def readyz(request: Request) -> Response:
     """Readiness: is the *model server* able to serve.
 
-    Reports not-ready while vLLM is still loading weights. Without this the
-    Service would route traffic to a gateway whose upstream is not up yet, and
-    the caller would see a 503 that looks like a gateway fault.
+    Reports 503 ('warming' or 'upstream-unhealthy') while vLLM is cold or still
+    loading weights.
+
+    NOTE ON KUBERNETES READINESS:
+    Do not use /readyz as the gateway pod's Kubernetes readinessProbe if you
+    intend to serve 503 warming responses from zero replicas. When vLLM has 0
+    replicas, /readyz returns 503, causing Kubernetes to remove gateway pods from
+    the Service endpoints, which converts clean warming responses into connection
+    timeouts at the load balancer. See k8s/gateway.yaml.
     """
     try:
         resp = await request.app.state.client.get("/health", timeout=5.0)

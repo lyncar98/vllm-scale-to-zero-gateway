@@ -56,6 +56,6 @@ shape and context lengths.
 
 ---
 
-This note accompanies *"Before Our First Token: Designing Self-Hosted
-Inference for an Agent That Plans a School Year"* -- see the main README for
-the article link and the rest of the series.
+This note accompanies *"Before Our First Token: Building Inference That's
+Safe to Turn On"* -- see the main README for the article link and the rest of
+the series.

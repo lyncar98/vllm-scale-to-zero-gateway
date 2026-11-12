@@ -44,11 +44,31 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
-          # Liveness deliberately hits /healthz (process-only) while readiness
-          # hits /readyz (checks the upstream). If liveness checked the
-          # upstream, a scaled-to-zero GPU pool would get the gateway itself
-          # killed and restarted in a loop -- exactly when it is most needed
-          # to report warming.
+          # Liveness and Readiness Probes:
+          #
+          # Liveness checks process health via /healthz.
+          #
+          # READINESS CONFIGURATION & THE COLD-START TRAP:
+          # The gateway exposes two health endpoints:
+          #   - /healthz: reports gateway process health.
+          #   - /readyz: probes upstream model server availability.
+          #
+          # IMPORTANT: Pointing the Kubernetes readinessProbe at /readyz creates
+          # an architectural cold-start trap. When the GPU pool scales to zero,
+          # /readyz returns 503 ("warming"). If Kubernetes uses that for pod readiness,
+          # it marks the gateway pod NotReady and removes it from the Service's
+          # active endpoints. Callers then receive generic connection timeouts or
+          # 502/504 errors from the AWS NLB instead of reaching the gateway to receive
+          # the structured "503 service_warming" response and Retry-After header!
+          #
+          # Rule: If an architecture relies on an always-available front door to
+          # manage cold starts, that front door's availability must not depend on
+          # the availability of the component it controls.
+          #
+          # Therefore, the gateway's Kubernetes readinessProbe targets /healthz so
+          # the gateway remains routable to serve warming responses when inference
+          # is offline. /readyz remains available for external monitoring and canary
+          # probes that specifically need to test end-to-end model availability.
           livenessProbe:
             httpGet:
               path: /healthz
@@ -56,7 +76,7 @@ spec:
             periodSeconds: 15
           readinessProbe:
             httpGet:
-              path: /readyz
+              path: /healthz
               port: http
             periodSeconds: 10
           securityContext:

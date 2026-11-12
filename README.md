@@ -7,10 +7,9 @@ underneath it.
 
 This is a working reference, not a product. It's the sanitized, genericized
 shape of infrastructure built for a real teaching-assistant agent (ChatLPO /
-Lautum) under the **AWS Startups Custom-Model Inference Program**, extracted
+Lautum) under the **AWS Startups Custom-Model Inference Fellowship**, extracted
 to be useful on its own. See the companion article, *"Before Our First
-Token: Designing Self-Hosted Inference for an Agent That Plans a School
-Year"* <!-- TODO: replace with the live Medium URL --> for the reasoning
+Token: Building Inference That's Safe to Turn On"* <!-- TODO: replace with the live Medium URL --> for the reasoning
 behind these choices and the measurements that are still in progress.
 
 ```
@@ -40,12 +39,15 @@ re-implement inference -- it owns exactly four things vLLM doesn't:
    first request after idle arrives with no GPU node in existence. A naive
    proxy surfaces that as a timeout; this gateway returns `503` with
    `Retry-After: 30` and `"type": "service_warming"`, so a caller can render
-   "warming up" instead of "error."
-3. **Readiness that reflects the upstream, not just this process.**
-   `/readyz` checks vLLM; `/healthz` checks only the gateway itself. If
-   liveness checked the upstream, a scaled-to-zero pool would get the
-   gateway killed in a restart loop -- precisely when it's most needed to
-   report warming.
+   "warming up" instead of "error." Note that *returning a warming response
+   does not wake the GPU* -- an out-of-band mechanism must drive scaling.
+3. **Separate process health from model readiness (avoiding the readiness trap).**
+   `/healthz` checks gateway process health; `/readyz` checks upstream vLLM.
+   In Kubernetes, the gateway pod's `readinessProbe` must remain decoupled from
+   upstream existence (`/healthz`) so that the gateway remains routable while
+   inference is scaled to zero. If the Service readiness probe checked `/readyz`,
+   an idle GPU pool would mark gateway pods NotReady, removing them from Service
+   endpoints and turning clean 503 warming responses into connection drops.
 4. **Content-free metering.** vLLM runs with `--disable-log-requests`. The
    gateway logs one JSON line per request -- served model name, status,
    latency, token counts, taken from the upstream's own `usage` object --
@@ -84,12 +86,42 @@ GATEWAY_REQUIRE_AUTH=false .venv/bin/uvicorn app.main:app --port 8080
    are plain manifests here so they're easy to read end to end; wire them
    into your own GitOps tool (Argo CD, Flux) for a real deployment.
 4. **Optional: wire scale-from-zero** (`k8s/autoscaling/`): the node pool and
-   Deployment above are *capable* of scaling to zero, but nothing acts on
-   that by default -- bringing a model server up from zero is a manual
-   `desired_size`/`kubectl scale` change until something watches for demand.
-   This directory has a worked Karpenter (node-level) + KEDA (pod-level,
-   driven by vLLM's own queue-depth metric) example. See its README for how
-   the two layers fit together.
+   Deployment above are *capable* of scaling to zero, but bringing a model
+   server up from zero requires an automated scaling architecture. This
+   directory provides an illustrative Karpenter (node-level) + KEDA (pod-level)
+   example. Note that vLLM's internal queue depth cannot report when replicas = 0;
+   see `k8s/autoscaling/README.md` for details on this limitation and candidate
+   activation patterns.
+
+## Current limitations and unfinished work
+
+This starter kit is an open-source reference implementation, not a finished
+production inference platform. Several key areas remain active engineering work
+and are intentionally documented as unfinished:
+
+- **Request-driven activation from zero (0 &rarr; 1):**
+  When vLLM has zero running replicas, it cannot emit metrics or report its own
+  queue depth (`vllm:num_requests_waiting`). While scaling 1 &rarr; N and scaling
+  down to 0 works off queue metrics, and a scheduled warm floor (via KEDA cron)
+  handles predictable school hours, arbitrary request-driven activation outside
+  those hours requires an external demand signal (e.g. gateway metrics or an
+  asynchronous queue).
+- **Decoupled gateway readiness:**
+  As documented in `k8s/gateway.yaml` and `docs/decisions.md`, binding Kubernetes
+  Service readiness to an offline upstream (`/readyz`) removes gateway pods from
+  endpoints, preventing callers from receiving the structured `503 service_warming`
+  response. The gateway's Kubernetes readiness probe must remain decoupled from
+  upstream model state.
+- **Model-serving environment validation:**
+  The model server Dockerfile pins a modern, Qwen3-compatible vLLM release
+  (`v0.8.5`) and enforces pinned model SHAs. Full validation of GPU compatibility,
+  memory allocation, and FP8/BF16 weights on actual hardware remains to be
+  completed.
+- **Application fallback under realistic failures:**
+  The gateway returns clean `503` warming responses with `Retry-After: 30`, but
+  end-to-end fallback handling (e.g., an agent falling back to managed models
+  during GPU startup or timeout) is application-specific and must be benchmarked
+  against real classroom workflows.
 
 ## What's deliberately out of scope
 
