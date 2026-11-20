@@ -60,9 +60,13 @@ _PROXY_ROUTES = {
     "/v1/completions",
     "/v1/embeddings",
     "/v1/models",
+    # The OpenAI Responses API. Stateless use only: vLLM keeps no durable
+    # response store the caller should rely on, so callers send `store: false`
+    # and replay their own conversation history.
+    "/v1/responses",
 }
 # Routes whose JSON body names the model. /v1/models has no body and always goes to the baked alias.
-_MODEL_ROUTES = {"/v1/chat/completions", "/v1/completions", "/v1/embeddings"}
+_MODEL_ROUTES = {"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/responses"}
 _PROBE_TTL_SECONDS = 10.0
 
 # Hop-by-hop headers must not be forwarded (RFC 7230 6.1). Forwarding

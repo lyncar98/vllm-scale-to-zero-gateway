@@ -78,11 +78,13 @@ variable "node_groups" {
     }
 
     gpu-inference = {
-      # g5.xlarge = 1x NVIDIA A10G (24GB). Fits an 8B checkpoint at
-      # bf16-with-quantization, or comfortably at 4-bit.
-      # g6e.xlarge (1x L40S, 48GB) is the upgrade path for a larger model --
-      # same pool, different instance type.
-      instance_types = ["g5.xlarge"]
+      # g6e.xlarge / g6e.2xlarge = 1x NVIDIA L40S (48GB VRAM; g6e.2xlarge adds
+      # 8 vCPU / 64 GiB host RAM).
+      # Sized for Qwen3.6-35B-A3B-FP8 (~35 GiB resident MoE weights + ~8.3 GiB
+      # hybrid KV/DeltaNet cache) -- an A10G 24GB (g5.xlarge) cannot hold the
+      # 35B MoE experts even in FP8, and the BF16 checkpoint (~67 GiB) does
+      # not fit on a single 48GB GPU either. See docs/kv-cache-sizing.md.
+      instance_types = ["g6e.xlarge", "g6e.2xlarge"]
       min_size       = 0
       max_size       = 4
       # Scale-to-zero by default. Bump to 1 for a prototype that needs to
@@ -102,7 +104,7 @@ variable "node_groups" {
 
       labels = {
         "inference.io/pool"        = "gpu-inference"
-        "inference.io/accelerator" = "nvidia-a10g"
+        "inference.io/accelerator" = "nvidia-l40s"
       }
 
       taints = [{

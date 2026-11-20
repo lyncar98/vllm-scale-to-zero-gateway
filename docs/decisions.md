@@ -52,25 +52,38 @@ node.
 
 **Routing by served name, from an allow-list.** The gateway never computes
 served names or guesses at a model's existence -- it routes only names present
-in a generated routing table (`scripts/generate_routes.py`), and returns `404
-model_not_found` for anything else. A routing file that's present but
+in a generated routing table (`gateway/scripts/generate_routes.py`), and returns
+`404 model_not_found` for anything else. A routing file that's present but
 unreadable is a hard `503`, not an empty table that silently sends traffic to
 the wrong model.
 
-**Content-free logging.** vLLM runs with `--disable-log-requests`. The
-gateway's own usage log line carries the served model name, status, latency
-and token counts -- never the prompt or the completion. If you have a
-regulatory reason to keep data out of general-purpose logs (and even if you
-don't), this is a cheap default to keep.
+**Content-free logging across both Chat Completions and the Responses API.**
+vLLM (`v0.19.0`) runs with `--no-enable-log-requests` (which replaced the older
+`--disable-log-requests` flag). The gateway proxies both `/v1/chat/completions`
+and `/v1/responses`, sniffing token counts (`prompt_tokens`/`completion_tokens`
+or `input_tokens`/`output_tokens`) on the fly without buffering the stream. Its
+usage log line carries the served model name, status, latency, and token counts
+-- never the prompt or the completion.
 
-**Weights are baked into the model-server image.** Rather than downloading at
-pod start: a cold request already pays node-provisioning latency, and adding
-a multi-GB download on top turns a short cold start into several minutes.
-It also makes "which weights served this request" answerable by an image
-digest instead of a mutable ref. The cost is a large image and a rebuild per
-model swap -- worth it until you're serving enough model variants that
-per-adapter image builds become the bottleneck, at which point loading a
-base model + adapter at startup (vLLM's `--enable-lora`) is the next step.
+**FP8 baked into the image for serving; BF16 kept in object storage for fine-tuning.**
+`Qwen/Qwen3.6-35B-A3B` is ~71.9 GB (~67 GiB) in BF16, which cannot fit on a single
+24 GB A10G (`g5.xlarge`) or a single 48 GB L40S (`g6e.2xlarge`). We keep the BF16
+checkpoint in object storage as the governed fine-tuning base, and bake the FP8
+checkpoint (`Qwen/Qwen3.6-35B-A3B-FP8`, ~35 GiB at pinned revision
+`c653bba46dfa06e9658dcc0b0dc87fe4685f14a2`) into the `model-server` image for
+single-GPU serving on `g6e.2xlarge`. Baking weights avoids a multi-GB runtime
+download on every scale-from-zero boot and ties "which weights served this
+request" to an immutable image digest.
+
+**Hybrid Gated DeltaNet + GQA sizing requires capping `--max-num-seqs` and skipping the vision tower.**
+`Qwen3.6-35B-A3B` (`Qwen3_5MoeForConditionalGeneration`) has 30 Gated DeltaNet
+(`linear_attention`) layers and 10 full-attention GQA layers, plus a multimodal
+vision tower. Passing `--language-model-only` skips the vision encoder and its
+16K-token profiling cache (~8 GiB VRAM), and capping `--max-num-seqs 16` keeps
+fixed per-sequence DeltaNet recurrent state to ~0.96 GiB (leaving vLLM's default
+256 sequences would demand ~15.35 GiB of recurrent state alone and OOM a 48 GB
+L40S). See [`docs/kv-cache-sizing.md`](kv-cache-sizing.md) and
+[`scripts/size_kv_cache.py`](../scripts/size_kv_cache.py).
 
 **The GPU node pool is tainted, and that's load-bearing.** Without the taint,
 ordinary pods schedule onto expensive accelerator nodes -- a failure mode

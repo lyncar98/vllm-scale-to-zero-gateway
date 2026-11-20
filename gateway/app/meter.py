@@ -146,7 +146,10 @@ class UsageSniffer:
         self._buffer = b""
         if not self._usage:
             return 0, 0
-        return int(self._usage.get("prompt_tokens") or 0), int(self._usage.get("completion_tokens") or 0)
+        # Chat completions name them prompt/completion tokens; the Responses API names them input/output.
+        tokens_in = self._usage.get("prompt_tokens") or self._usage.get("input_tokens") or 0
+        tokens_out = self._usage.get("completion_tokens") or self._usage.get("output_tokens") or 0
+        return int(tokens_in), int(tokens_out)
 
     def _line(self, line: bytes) -> None:
         if b'"usage"' not in line:
@@ -161,7 +164,12 @@ class UsageSniffer:
             doc = json.loads(payload)
         except ValueError:
             return
-        usage = doc.get("usage") if isinstance(doc, dict) else None
+        if not isinstance(doc, dict):
+            return
+        usage = doc.get("usage")
+        if usage is None and isinstance(doc.get("response"), dict):
+            # Responses API stream: usage rides on the `response.completed` event's `response`.
+            usage = doc["response"].get("usage")
         if isinstance(usage, dict):
             self._usage = usage
 

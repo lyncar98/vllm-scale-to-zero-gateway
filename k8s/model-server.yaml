@@ -48,36 +48,54 @@ spec:
       terminationGracePeriodSeconds: 60
       containers:
         - name: vllm
-          image: ghcr.io/example/model-server:v0.1.0
+          image: ghcr.io/example/model-server:v0.2.0
           ports:
             - name: http
               containerPort: 8000
           env:
             - name: MAX_MODEL_LEN
-              # Well under the model's theoretical maximum: KV cache is the
-              # binding constraint on a 24GB GPU, so a larger window trades
-              # away concurrency. Raise deliberately, with a load test.
-              value: "8192"
+              # Set from physical hybrid KV capacity (~108,768 tokens in the
+              # 8.33 GiB remaining on a 48 GB L40S after loading
+              # Qwen3.6-35B-A3B-FP8 with --language-model-only and
+              # --max-num-seqs 16) and our measured workload baseline (peak
+              # run 47.3K input tokens, 2x headroom = 98,304). See
+              # docs/kv-cache-sizing.md and scripts/size_kv_cache.py.
+              value: "98304"
             - name: GPU_MEMORY_UTILIZATION
-              # Headroom so a burst of long prompts does not OOM the worker.
-              value: "0.90"
+              # Leaves ~2.4 GiB headroom on a 48 GB L40S so a burst of long
+              # tool-calling prompts does not OOM the worker.
+              value: "0.95"
+            - name: PYTORCH_CUDA_ALLOC_CONF
+              value: "expandable_segments:True"
+            - name: TOOL_CALL_PARSER
+              value: "qwen3_coder"
+            - name: EXTRA_VLLM_ARGS
+              # Qwen3.6-35B-A3B ships with a multimodal
+              # (Qwen3_5MoeForConditionalGeneration) vision tower;
+              # --language-model-only skips the vision encoder and its 16k-token
+              # profiling cache (~8 GiB VRAM) for text serving. Because 30 of
+              # the model's 40 layers are Gated DeltaNet, vLLM pre-allocates
+              # recurrent state blocks per concurrent sequence (--max-num-seqs);
+              # capping --max-num-seqs 16 keeps recurrent state to ~1 GiB so
+              # the remaining pool goes to paged KV blocks.
+              value: "--language-model-only --max-num-seqs 16 --max-num-batched-tokens 2048 --enforce-eager"
           resources:
             limits:
               nvidia.com/gpu: "1"
             requests:
               nvidia.com/gpu: "1"
-              cpu: "2"
-              memory: 12Gi
-          # Loading many GB of weights into VRAM takes minutes. A startupProbe
-          # (rather than a long initialDelaySeconds on readiness) lets the
-          # liveness probe stay aggressive once running while still tolerating
-          # a slow boot: 60 * 10s = up to 10 minutes to become ready.
+              cpu: "4"
+              memory: 48Gi
+          # Loading a ~35 GiB FP8 MoE checkpoint into VRAM takes several
+          # minutes. A startupProbe (rather than a long initialDelaySeconds on
+          # readiness) lets the liveness probe stay aggressive once running
+          # while still tolerating a slow boot: 90 * 10s = up to 15 minutes.
           startupProbe:
             httpGet:
               path: /health
               port: http
             periodSeconds: 10
-            failureThreshold: 60
+            failureThreshold: 90
           readinessProbe:
             httpGet:
               path: /health

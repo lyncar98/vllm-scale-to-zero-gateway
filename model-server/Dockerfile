@@ -12,16 +12,19 @@
 #     answerable. An image digest answers it exactly; a runtime download from
 #     a mutable ref does not.
 #
-# The cost is a large image (an 8B checkpoint in bf16 is roughly 16GB). Give
-# the GPU node group a large root volume and consider a dedicated ECR/registry
-# repo so a gateway fix doesn't rebuild or re-push this artifact.
+# Serving target (v0.2): Qwen/Qwen3.6-35B-A3B-FP8 (~35 GiB weights) on a
+# single g6e.2xlarge (1x NVIDIA L40S, 48 GB VRAM).
+# The BF16 base checkpoint (Qwen/Qwen3.6-35B-A3B, ~71.9 GB / ~67 GiB) is kept
+# in object storage as the governed fine-tuning base; it does not fit on a
+# single 24 GB A10G (g5.xlarge) or 48 GB L40S (g6e.2xlarge), so the FP8
+# checkpoint is what we bake and serve.
 
 # ---------------------------------------------------------------------------
 # Stage 1 - fetch the checkpoint.
 # ---------------------------------------------------------------------------
 FROM python:3.12-slim AS weights
 
-ARG MODEL_REPO=Qwen/Qwen3-8B
+ARG MODEL_REPO=Qwen/Qwen3.6-35B-A3B-FP8
 
 # MODEL_REVISION must be a full commit SHA in any environment you care about.
 # "main" is a mutable branch pointer: two builds a week apart can produce
@@ -30,11 +33,14 @@ ARG MODEL_REPO=Qwen/Qwen3-8B
 # this is still "main" -- pass a real SHA with --build-arg.
 #
 # Resolve the current SHA with:
-#   curl -s https://huggingface.co/api/models/Qwen/Qwen3-8B | jq -r .sha
+#   curl -s https://huggingface.co/api/models/Qwen/Qwen3.6-35B-A3B-FP8 | jq -r .sha
+#
+# Pinned SHA validated for v0.2:
+#   c653bba46dfa06e9658dcc0b0dc87fe4685f14a2
 ARG MODEL_REVISION=main
 RUN if [ "$MODEL_REVISION" = "main" ]; then \
       echo "MODEL_REVISION is still 'main'. Pass a pinned commit SHA:" >&2; \
-      echo "  docker build --build-arg MODEL_REVISION=<sha> ..." >&2; \
+      echo "  docker build --build-arg MODEL_REVISION=c653bba46dfa06e9658dcc0b0dc87fe4685f14a2 ..." >&2; \
       echo "A mutable branch pointer breaks the audit property this design exists to provide." >&2; \
       exit 1; \
     fi
@@ -48,6 +54,9 @@ ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 # Optional: only needed for gated repos.
 ARG HF_TOKEN=""
+ENV MODEL_REPO=${MODEL_REPO}
+ENV MODEL_REVISION=${MODEL_REVISION}
+ENV HF_TOKEN=${HF_TOKEN}
 
 WORKDIR /weights
 RUN python -c "\
@@ -68,19 +77,17 @@ snapshot_download( \
 # ---------------------------------------------------------------------------
 # Stage 2 - runtime.
 # ---------------------------------------------------------------------------
-# vLLM's official image already carries CUDA, PyTorch and the OpenAI-compatible
-# server. Pin to a current release that supports your target model family --
-# Qwen3 support landed in v0.8.4 (github.com/vllm-project/vllm/pull/15289);
-# v0.8.5 is the release vLLM's own notes call "day 0 support for Qwen3,"
-# fixing FP8 weight loading and adding tuned MoE configs, so it's the floor
-# here rather than v0.8.4. Pinned by tag (not :latest) so a rebuild is
-# reproducible -- re-check this against your actual target model before
-# reusing it for something newer.
-FROM vllm/vllm-openai:v0.8.5
+# The Qwen3.6 vLLM serving recipe requires vLLM >= 0.17.0 for the hybrid
+# Qwen3_5MoeForConditionalGeneration architecture (30 Gated DeltaNet linear-
+# attention layers + 10 full-attention GQA layers, 256 routed experts). The
+# v0.8.5 image from v0.1 of this repo predates Qwen3.6 and cannot load the
+# checkpoint. We pin v0.19.0 by tag (not :latest) so rebuilds stay
+# reproducible.
+FROM vllm/vllm-openai:v0.19.0
 
 # vLLM's entrypoint is the OpenAI-compatible API server. Override it only to
-# supply our own defaults; the flags stay overridable from the Helm values so
-# tuning does not require an image rebuild.
+# supply our own defaults; the flags stay overridable from Kubernetes env vars
+# so tuning does not require rebuilding a ~35 GiB image layer.
 COPY --from=weights /weights/model /opt/model
 
 ENV MODEL_PATH=/opt/model
@@ -90,21 +97,35 @@ ENV MODEL_PATH=/opt/model
 # fine-tune does not change the client contract.
 ENV SERVED_MODEL_NAME=default
 
+# Tool-call parser from the Qwen3.6 vLLM recipe. In our baseline workload,
+# 82% of teacher runs invoke tools (2.7 tool calls/run overall), so structured
+# tool-call parsing is enabled by default and overridable via TOOL_CALL_PARSER.
+ENV TOOL_CALL_PARSER=qwen3_coder
+
 EXPOSE 8000
 
-# --max-model-len is capped well below the model's theoretical context because
-# KV cache is the binding constraint on a 24GB GPU; raising it trades
-# concurrency for context. --gpu-memory-utilization leaves headroom so a burst
-# of long prompts does not OOM the worker.
+# Flag notes for Qwen3.6-35B-A3B-FP8 on a single 48 GB L40S (g6e.2xlarge):
+#   * --trust-remote-code and --reasoning-parser qwen3: required for the
+#     Qwen3.6 MoE architecture and thinking traces.
+#   * --enable-auto-tool-choice --tool-call-parser qwen3_coder: required by
+#     the Qwen3.6 recipe so tool calls return structured tool_calls objects
+#     instead of raw XML/text in the completion body.
+#   * --max-model-len: sized from workload baseline + physical KV budget (see
+#     docs/kv-cache-sizing.md and scripts/size_kv_cache.py). If MAX_MODEL_LEN
+#     is set, pass it; otherwise let EXTRA_VLLM_ARGS or vLLM's config govern.
+#   * --no-enable-log-requests: replaces --disable-log-requests (removed in
+#     vLLM v0.19). Prompts and completions are governed customer content and
+#     must never echo into pod stdout.
 ENTRYPOINT ["/bin/sh", "-c", "exec python3 -m vllm.entrypoints.openai.api_server \
   --model ${MODEL_PATH} \
   --served-model-name ${SERVED_MODEL_NAME} \
   --host 0.0.0.0 \
   --port 8000 \
-  --max-model-len ${MAX_MODEL_LEN:-8192} \
-  --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.90} \
-  --disable-log-requests \
+  --trust-remote-code \
+  --reasoning-parser qwen3 \
+  --enable-auto-tool-choice \
+  --tool-call-parser ${TOOL_CALL_PARSER:-qwen3_coder} \
+  ${MAX_MODEL_LEN:+--max-model-len ${MAX_MODEL_LEN}} \
+  --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.95} \
+  --no-enable-log-requests \
   ${EXTRA_VLLM_ARGS}"]
-# --disable-log-requests: prompts and completions are often governed customer
-# content. Echoing them into this pod's stdout would copy that data into
-# whatever log sink your cluster ships to, outside any governed audit path.

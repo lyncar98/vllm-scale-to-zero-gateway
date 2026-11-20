@@ -25,7 +25,7 @@ spec:
         inference.io/pool: system
       containers:
         - name: gateway
-          image: ghcr.io/example/inference-gateway:v0.1.0
+          image: ghcr.io/example/inference-gateway:v0.2.0
           ports:
             - name: http
               containerPort: 8080

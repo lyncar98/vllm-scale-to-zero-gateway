@@ -4,10 +4,12 @@ on:
   push:
     paths:
       - "gateway/**"
+      - "scripts/**"
       - ".github/workflows/gateway.yml"
   pull_request:
     paths:
       - "gateway/**"
+      - "scripts/**"
       - ".github/workflows/gateway.yml"
 
 jobs:
@@ -22,5 +24,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
-      - run: ruff check .
+      - run: ruff check . ../scripts
       - run: pytest -q
