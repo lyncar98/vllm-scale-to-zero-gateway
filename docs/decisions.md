@@ -67,23 +67,45 @@ usage log line carries the served model name, status, latency, and token counts
 
 **FP8 baked into the image for serving; BF16 kept in object storage for fine-tuning.**
 `Qwen/Qwen3.6-35B-A3B` is ~71.9 GB (~67 GiB) in BF16, which cannot fit on a single
-24 GB A10G (`g5.xlarge`) or a single 48 GB L40S (`g6e.2xlarge`). We keep the BF16
-checkpoint in object storage as the governed fine-tuning base, and bake the FP8
-checkpoint (`Qwen/Qwen3.6-35B-A3B-FP8`, ~35 GiB at pinned revision
+A10G (`g5.xlarge`) or a single L40S (`g6e.2xlarge`). We keep the BF16 checkpoint
+in object storage as the governed fine-tuning base, and bake the FP8 checkpoint
+(`Qwen/Qwen3.6-35B-A3B-FP8`, ~35 GiB at pinned revision
 `c653bba46dfa06e9658dcc0b0dc87fe4685f14a2`) into the `model-server` image for
 single-GPU serving on `g6e.2xlarge`. Baking weights avoids a multi-GB runtime
 download on every scale-from-zero boot and ties "which weights served this
 request" to an immutable image digest.
 
+**Physical GPU GiB, not marketing GB, governs KV-cache sizing.**
+AWS markets the L40S at "48 GB", lists ~44 GiB in the EC2 G6e technical
+specifications, and physical ECC-enabled device readings report ~44.99 GiB.
+Treating an L40S as `48.0 GiB` overstates the remaining paged KV-cache budget
+on a ~35 GiB FP8 checkpoint by ~2.86 GiB (`7.37 GiB` vs. `4.51 GiB` after
+`2.27 GiB` runtime workspace and `0.96 GiB` DeltaNet recurrent state for 16
+slots). Under our provisional hybrid-cache calibration, `44.99 GiB` yields
+`~66,544` modeled tokens rather than `~108,768`. Because `98,304` was a
+heuristic derived from *cumulative* multi-call run tokens (`2x 49,391`) rather
+than single-invocation residency (`~11.1K-15.8K`), `k8s/model-server.yaml`
+defaults `MAX_MODEL_LEN` to `49152` (`48 Ki`) for single-L40S segmented
+workflows until physical vLLM startup block counts and our 128K vs. segmented
+curriculum quality evaluation say otherwise. See
+[`docs/kv-cache-sizing.md`](kv-cache-sizing.md) and
+[`scripts/size_kv_cache.py`](../scripts/size_kv_cache.py).
+
 **Hybrid Gated DeltaNet + GQA sizing requires capping `--max-num-seqs` and skipping the vision tower.**
 `Qwen3.6-35B-A3B` (`Qwen3_5MoeForConditionalGeneration`) has 30 Gated DeltaNet
 (`linear_attention`) layers and 10 full-attention GQA layers, plus a multimodal
-vision tower. Passing `--language-model-only` skips the vision encoder and its
-16K-token profiling cache (~8 GiB VRAM), and capping `--max-num-seqs 16` keeps
-fixed per-sequence DeltaNet recurrent state to ~0.96 GiB (leaving vLLM's default
-256 sequences would demand ~15.35 GiB of recurrent state alone and OOM a 48 GB
-L40S). See [`docs/kv-cache-sizing.md`](kv-cache-sizing.md) and
-[`scripts/size_kv_cache.py`](../scripts/size_kv_cache.py).
+vision tower. Passing `--language-model-only` skips the vision encoder (~8 GiB
+VRAM), and capping `--max-num-seqs 16` keeps fixed per-sequence DeltaNet
+recurrent state to ~0.96 GiB (leaving vLLM's historical default 256 sequences
+would demand ~15.35 GiB of recurrent state alone).
+
+**Reasoning + tool-call parser interaction must be validated before un-flagged rollout.**
+We follow Qwen's vLLM recipe (`--reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder`),
+but in vLLM 0.19 related `Qwen3.5`/`3.6` models have a reported edge case where
+tool calls emitted inside a reasoning block are not always extracted cleanly.
+Application traffic stays behind a feature flag with managed-model fallback
+while structured and streaming tool extraction is validated across all agent
+tools.
 
 **The GPU node pool is tainted, and that's load-bearing.** Without the taint,
 ordinary pods schedule onto expensive accelerator nodes -- a failure mode

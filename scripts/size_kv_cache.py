@@ -1,42 +1,53 @@
-"""Hybrid KV-cache and GPU instance sizer fed by measured workload baselines.
+"""Hybrid KV-cache and GPU instance sizer for Qwen3.6-35B-A3B on vLLM.
 
 Why this script exists:
-  Standard transformer KV-cache calculators assume every layer stores a K and V
-  tensor per token:
+  1. Standard transformer KV-cache formulas assume every layer stores a K and V
+     tensor per token:
 
-      KV bytes/token = 2 * num_layers * num_kv_heads * head_dim * kv_bytes
+         KV bytes/token = 2 * num_layers * num_kv_heads * head_dim * kv_bytes
 
-  Qwen/Qwen3.6-35B-A3B (architecture ``Qwen3_5MoeForConditionalGeneration``)
-  breaks that assumption in three ways:
-    1. Hybrid attention (30 Gated DeltaNet + 10 full-attention GQA layers).
-       Only 10 of the 40 layers (``full_attention_interval = 4``) allocate a
-       per-token KV cache (2 KV heads, head_dim 256 -> 20 KiB/token in BF16).
-    2. Fixed recurrent state per concurrent sequence (``--max-num-seqs``).
-       The 30 Gated DeltaNet (``linear_attention``) layers maintain a fixed-size
-       float32 recurrent state matrix ``(32, 128, 128)`` (2.0 MiB/layer) plus a
-       short causal conv state ``(8192, 3)`` in BF16 (48 KiB/layer) per active
-       sequence -- ~61.4 MiB per sequence slot across 30 layers regardless of
-       whether a prompt is 500 tokens or 100,000 tokens. vLLM allocates these
-       recurrent state blocks per ``--max-num-seqs`` out of the same unified
-       GPU memory pool as the paged KV cache.
-    3. Multimodal vision tower present in the checkpoint.
-       Unless ``--language-model-only`` is passed, vLLM loads the vision encoder
-       and profiles a 16K-token vision cache (~8.0 GiB VRAM), starving the text
-       KV pool on a 48 GB GPU.
+     Qwen/Qwen3.6-35B-A3B (``Qwen3_5MoeForConditionalGeneration``) has 40 layers,
+     but only 10 use full grouped-query attention (2 KV heads, head_dim 256 ->
+     20.0 KiB/token in BF16). The other 30 layers use Gated DeltaNet
+     (``linear_attention``), which allocates a fixed recurrent + causal-conv
+     state of ~61.41 MiB per active sequence slot (``--max-num-seqs``),
+     independent of context length.
 
-  This script takes the aggregate numbers from our test-environment baseline
-  (input tokens per run, prompt-cache hit rate, tool-call frequency, and the
-  corrected output-token ceiling after accounting for multi-section artifact
-  collaborator writes) and computes:
-    - Per-token full-attention KV cost and per-sequence DeltaNet recurrent cost
-    - Recommended ``--max-model-len`` and ``--max-num-seqs``
-    - Which single-GPU / multi-GPU instance shapes fit the model + cache
-    - Ready-to-paste vLLM serve flags
+  2. Marketing GPU memory != usable physical GiB.
+     An NVIDIA L40S is marketed at "48 GB", listed at ~44 GiB in AWS EC2 G6e
+     technical specifications, and reports ~44.99 GiB of physical device memory
+     with ECC enabled. Treating an L40S as 48.0 GiB overstates the remaining
+     paged KV-cache pool on a 35 GiB FP8 checkpoint by ~3.01 GiB (nearly 40%).
+
+  3. Cumulative agent tokens != single-invocation resident context.
+     In a multi-step agent loop, each tool round-trip re-sends the system
+     prefix, tool schemas, and prior turns. Our heaviest baseline run (R11)
+     metered 47,305 cumulative input tokens (92.8% cached) + 356 metered output
+     tokens + ~1,730 collaborator output tokens = 49,391 cumulative tokens
+     across 4 tool calls (5 model invocations), while peak single-invocation
+     resident context was ~11.1K-15.8K tokens.
+
+  This utility evaluates three candidate context targets against physical GPU
+  memory (defaulting to 44.99 GiB for L40S, with --l40s-vram-gib to compare
+  44.0 GiB spec or 48.0 GiB nominal assumptions):
+    - ``per-invocation`` (49,152 tokens): ~3x peak single-invocation residency
+      in our baseline for segmented agent workflows.
+    - ``cumulative-2x``  (98,304 tokens): the provisional 2x cumulative-run
+      heuristic (does NOT fit on one 44.99 GiB L40S under current hybrid-cache
+      overhead assumptions).
+    - ``qwen-128k``      (131,072 tokens): Qwen's recommended >=128K context
+      for complex unsegmented tasks (requires multi-GPU or KV quantization).
+
+  NOTE: Token capacities are modeled planning estimates using a provisional
+  3.5526x hybrid-page overhead factor (71.05 KiB/token effective vs. 20.0
+  KiB/token raw full-attention KV). They must be reconciled with preserved
+  vLLM startup profiles from the deployed GPU before claiming a validated
+  production context ceiling.
 
 Usage:
     python scripts/size_kv_cache.py
-    python scripts/size_kv_cache.py --concurrency 16 --model qwen3.6-35b-a3b-fp8
-    python scripts/size_kv_cache.py --json
+    python scripts/size_kv_cache.py --l40s-vram-gib 48.0
+    python scripts/size_kv_cache.py --concurrency 16 --json
 """
 
 from __future__ import annotations
@@ -54,7 +65,7 @@ TOKEN_ALIGNMENT = 16_384
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """Architectural parameters pulled directly from the Hugging Face config.json."""
+    """Architectural parameters from the Hugging Face config.json."""
 
     key: str
     repo_id: str
@@ -62,6 +73,7 @@ class ModelSpec:
     precision: str
     weights_gib: float
     native_max_position_embeddings: int
+    recommended_complex_task_context: int
     total_layers: int
     full_attention_layers: int
     kv_heads: int
@@ -79,19 +91,18 @@ class ModelSpec:
     # when --language-model-only is NOT passed).
     vision_tower_overhead_gib: float
     # CUDA context, PyTorch allocator fragmentation, and non-cache runtime workspace
-    # inside vLLM's allocated budget under --enforce-eager.
+    # under --enforce-eager.
     runtime_workspace_gib: float
-    # vLLM's unified hybrid KV/Mamba cache manager aligns page blocks across the
-    # full-attention and Gated DeltaNet groups; empirically on vLLM 0.19 with
-    # Qwen3.6-35B-A3B-FP8 on an L40S, 8.33 GiB of available KV memory yields
-    # 108,768 tokens at max_num_seqs=16.
+    # Provisional calibration factor comparing vLLM's unified hybrid KV/Mamba page
+    # allocator against raw full-attention KV bytes (20.0 KiB/token * 3.5526 ≈
+    # 71.05 KiB/token). Must be reconciled against raw vLLM startup block counts.
     hybrid_page_overhead_factor: float = 3.5526
     tool_call_parser: str = "qwen3_coder"
     reasoning_parser: str = "qwen3"
 
     @property
     def full_attention_kv_bytes_per_token(self) -> int:
-        """Raw K + V bytes per token across the full-attention (GQA) layers only."""
+        """Theoretical K + V bytes per token across the full-attention (GQA) layers only."""
         return (
             2
             * self.full_attention_layers
@@ -102,7 +113,7 @@ class ModelSpec:
 
     @property
     def effective_kv_bytes_per_token(self) -> int:
-        """Effective paged-pool bytes per token including vLLM hybrid block alignment."""
+        """Provisional effective paged-pool bytes per token with hybrid block alignment."""
         return int(round(self.full_attention_kv_bytes_per_token * self.hybrid_page_overhead_factor))
 
     @property
@@ -133,10 +144,10 @@ class ModelSpec:
 
 @dataclass(frozen=True)
 class WorkloadBaseline:
-    """Aggregate measurements from our 11-run test-environment teacher baseline.
+    """Sanitized aggregate measurements from our 11-run test-environment sample.
 
-    No raw prompts, user identifiers, or conversation transcripts are stored
-    here -- only the summary statistics needed to size context and concurrency.
+    Separates cumulative multi-call run totals (which drive token billing) from
+    estimated single-invocation resident context (which drives GPU KV residency).
     """
 
     runs_measured: int = 11
@@ -149,15 +160,20 @@ class WorkloadBaseline:
     tool_run_cache_hit_rate: float = 0.910
     artifact_run_input_tokens_avg: int = 37_369
     non_artifact_tool_run_input_tokens_avg: int = 27_899
+    # Cumulative input summed across all model round-trips in peak run R11 (4 tool calls).
     peak_run_input_tokens: int = 47_305
+    peak_run_cached_input_tokens: int = 43_899
+    peak_run_invocations_est: int = 5
+    # Peak single-invocation resident context on R11 (~11.1K on 5 invocations,
+    # up to ~15.8K if compressed into 4 invocations).
+    peak_single_invocation_tokens_est: int = 15_800
     peak_run_metered_output_tokens: int = 356
     metered_output_tokens_avg: int = 441
-    # Multi-section artifact collaborator calls originally streamed outside the
-    # main run meter (~6,909 chars / ~1,730 tokens on the peak 6-version run).
+    # Multi-section write_artifact collaborator calls originally streamed outside
+    # the main run meter (~6,909 chars / ~1,730 tokens on the peak 6-version run).
     unmetered_artifact_output_tokens_peak: int = 1_730
-    # Multiplier applied to peak single-run tokens to allow multi-turn growth
-    # and background batch year-plan runs without hitting truncation.
     headroom_multiplier: float = 2.0
+    per_invocation_headroom_multiplier: float = 3.0
     target_concurrency: int = 16
 
     @property
@@ -180,9 +196,20 @@ class WorkloadBaseline:
             + self.unmetered_artifact_output_tokens_peak
         )
 
-    def recommended_max_model_len(self, *, native_limit: int) -> int:
-        """Target --max-model-len aligned to a 16K boundary, capped at native_limit."""
+    def cumulative_heuristic_max_model_len(self, *, native_limit: int) -> int:
+        """Provisional 2x cumulative-run heuristic (98,304 tokens for R11)."""
         raw_target = int(round(self.peak_run_corrected_total_tokens * self.headroom_multiplier))
+        aligned = max(
+            TOKEN_ALIGNMENT,
+            int(round(raw_target / TOKEN_ALIGNMENT)) * TOKEN_ALIGNMENT,
+        )
+        return min(aligned, native_limit)
+
+    def per_invocation_segmented_max_model_len(self, *, native_limit: int) -> int:
+        """Segmented single-invocation target (~3x peak per-invocation residency -> 49,152)."""
+        raw_target = int(
+            round(self.peak_single_invocation_tokens_est * self.per_invocation_headroom_multiplier)
+        )
         aligned = max(
             TOKEN_ALIGNMENT,
             int(round(raw_target / TOKEN_ALIGNMENT)) * TOKEN_ALIGNMENT,
@@ -196,6 +223,8 @@ class InstanceSpec:
     gpu_model: str
     gpu_count: int
     vram_gib: float
+    nominal_marketing_gb: int
+    aws_spec_gib: float
     vcpus: int
     host_ram_gib: int
     hourly_usd_est: float
@@ -209,6 +238,7 @@ MODELS: dict[str, ModelSpec] = {
         precision="FP8 (weights) / BF16 (KV) / FP32 (DeltaNet state)",
         weights_gib=35.0,
         native_max_position_embeddings=262_144,
+        recommended_complex_task_context=131_072,
         total_layers=40,
         full_attention_layers=10,
         kv_heads=2,
@@ -233,6 +263,7 @@ MODELS: dict[str, ModelSpec] = {
         precision="BF16 (weights & KV) / FP32 (DeltaNet state)",
         weights_gib=67.0,
         native_max_position_embeddings=262_144,
+        recommended_complex_task_context=131_072,
         total_layers=40,
         full_attention_layers=10,
         kv_heads=2,
@@ -257,6 +288,7 @@ MODELS: dict[str, ModelSpec] = {
         precision="BF16 (dense GQA reference from v0.1)",
         weights_gib=15.3,
         native_max_position_embeddings=32_768,
+        recommended_complex_task_context=32_768,
         total_layers=36,
         full_attention_layers=36,
         kv_heads=8,
@@ -276,35 +308,53 @@ MODELS: dict[str, ModelSpec] = {
     ),
 }
 
-INSTANCES: tuple[InstanceSpec, ...] = (
-    InstanceSpec(
-        name="g5.xlarge",
-        gpu_model="1x NVIDIA A10G",
-        gpu_count=1,
-        vram_gib=24.0,
-        vcpus=4,
-        host_ram_gib=16,
-        hourly_usd_est=1.006,
-    ),
-    InstanceSpec(
-        name="g6e.2xlarge",
-        gpu_model="1x NVIDIA L40S",
-        gpu_count=1,
-        vram_gib=48.0,
-        vcpus=8,
-        host_ram_gib=64,
-        hourly_usd_est=2.242,
-    ),
-    InstanceSpec(
-        name="g6e.12xlarge",
-        gpu_model="4x NVIDIA L40S",
-        gpu_count=4,
-        vram_gib=192.0,
-        vcpus=48,
-        host_ram_gib=384,
-        hourly_usd_est=10.493,
-    ),
-)
+
+def build_instances(*, l40s_vram_gib: float = 44.99) -> tuple[InstanceSpec, ...]:
+    """Build GPU instance specifications using physical device memory in GiB.
+
+    AWS markets the L40S as 48 GB, lists ~44 GiB in the EC2 G6e instance
+    specifications, and physical ECC-enabled device readings report ~44.99 GiB.
+    Similarly, an A10G (24 GB marketing) reports ~22.20 GiB physical device
+    memory (~23 GiB in EC2 G5 specs).
+    """
+    return (
+        InstanceSpec(
+            name="g5.xlarge",
+            gpu_model="1x NVIDIA A10G",
+            gpu_count=1,
+            vram_gib=22.20,
+            nominal_marketing_gb=24,
+            aws_spec_gib=23.0,
+            vcpus=4,
+            host_ram_gib=16,
+            hourly_usd_est=1.006,
+        ),
+        InstanceSpec(
+            name="g6e.2xlarge",
+            gpu_model="1x NVIDIA L40S",
+            gpu_count=1,
+            vram_gib=l40s_vram_gib,
+            nominal_marketing_gb=48,
+            aws_spec_gib=44.0,
+            vcpus=8,
+            host_ram_gib=64,
+            hourly_usd_est=2.242,
+        ),
+        InstanceSpec(
+            name="g6e.12xlarge",
+            gpu_model="4x NVIDIA L40S",
+            gpu_count=4,
+            vram_gib=round(4 * l40s_vram_gib, 2),
+            nominal_marketing_gb=192,
+            aws_spec_gib=176.0,
+            vcpus=48,
+            host_ram_gib=384,
+            hourly_usd_est=10.493,
+        ),
+    )
+
+
+INSTANCES: tuple[InstanceSpec, ...] = build_instances()
 
 
 @dataclass(frozen=True)
@@ -312,6 +362,8 @@ class InstanceEvaluation:
     instance: str
     gpu_model: str
     vram_gib: float
+    nominal_marketing_gb: int
+    aws_spec_gib: float
     usable_vram_gib: float
     weights_gib: float
     vision_overhead_gib: float
@@ -319,8 +371,12 @@ class InstanceEvaluation:
     total_cache_pool_gib: float
     deltanet_state_pool_gib: float
     paged_kv_pool_gib: float
-    physical_kv_token_capacity: int
+    modeled_kv_token_capacity: int
+    theoretical_raw_kv_token_capacity: int
     target_max_model_len: int
+    fits_per_invocation_target: bool
+    fits_cumulative_heuristic: bool
+    fits_qwen_128k_recommendation: bool
     max_num_seqs: int
     fits: bool
     reason: str
@@ -331,28 +387,34 @@ def evaluate_instance(
     instance: InstanceSpec,
     *,
     target_max_model_len: int,
+    per_invocation_target: int = 49_152,
+    cumulative_heuristic_target: int = 98_304,
     max_num_seqs: int,
     gpu_memory_utilization: float = 0.95,
     language_model_only: bool = True,
 ) -> InstanceEvaluation:
-    """Compute the VRAM budget and physical token capacity on a candidate GPU shape."""
-    usable_vram_gib = instance.vram_gib * gpu_memory_utilization
+    """Compute the modeled VRAM budget and token capacity on a candidate GPU shape."""
+    usable_vram_gib = round(instance.vram_gib * gpu_memory_utilization, 2)
     vision_overhead_gib = 0.0 if language_model_only else model.vision_tower_overhead_gib
-    total_cache_pool_gib = (
+    total_cache_pool_gib = round(
         usable_vram_gib
         - model.weights_gib
         - vision_overhead_gib
-        - model.runtime_workspace_gib
+        - model.runtime_workspace_gib,
+        2,
     )
-    deltanet_state_pool_gib = (
-        max_num_seqs * model.deltanet_state_bytes_per_sequence
-    ) / GIB
+    deltanet_state_pool_gib = round(
+        (max_num_seqs * model.deltanet_state_bytes_per_sequence) / GIB,
+        2,
+    )
 
     if model.weights_gib > usable_vram_gib:
         return InstanceEvaluation(
             instance=instance.name,
             gpu_model=instance.gpu_model,
             vram_gib=instance.vram_gib,
+            nominal_marketing_gb=instance.nominal_marketing_gb,
+            aws_spec_gib=instance.aws_spec_gib,
             usable_vram_gib=round(usable_vram_gib, 2),
             weights_gib=model.weights_gib,
             vision_overhead_gib=vision_overhead_gib,
@@ -360,22 +422,28 @@ def evaluate_instance(
             total_cache_pool_gib=round(total_cache_pool_gib, 2),
             deltanet_state_pool_gib=round(deltanet_state_pool_gib, 2),
             paged_kv_pool_gib=0.0,
-            physical_kv_token_capacity=0,
+            modeled_kv_token_capacity=0,
+            theoretical_raw_kv_token_capacity=0,
             target_max_model_len=target_max_model_len,
+            fits_per_invocation_target=False,
+            fits_cumulative_heuristic=False,
+            fits_qwen_128k_recommendation=False,
             max_num_seqs=max_num_seqs,
             fits=False,
             reason=(
                 f"weights alone ({model.weights_gib:.1f} GiB) exceed usable VRAM "
-                f"({usable_vram_gib:.1f} GiB at {gpu_memory_utilization:.2f} utilization)"
+                f"({usable_vram_gib:.2f} GiB at {gpu_memory_utilization:.2f} utilization)"
             ),
         )
 
-    paged_kv_pool_gib = total_cache_pool_gib - deltanet_state_pool_gib
+    paged_kv_pool_gib = round(total_cache_pool_gib - deltanet_state_pool_gib, 2)
     if paged_kv_pool_gib <= 0:
         return InstanceEvaluation(
             instance=instance.name,
             gpu_model=instance.gpu_model,
             vram_gib=instance.vram_gib,
+            nominal_marketing_gb=instance.nominal_marketing_gb,
+            aws_spec_gib=instance.aws_spec_gib,
             usable_vram_gib=round(usable_vram_gib, 2),
             weights_gib=model.weights_gib,
             vision_overhead_gib=vision_overhead_gib,
@@ -383,8 +451,12 @@ def evaluate_instance(
             total_cache_pool_gib=round(total_cache_pool_gib, 2),
             deltanet_state_pool_gib=round(deltanet_state_pool_gib, 2),
             paged_kv_pool_gib=round(paged_kv_pool_gib, 2),
-            physical_kv_token_capacity=0,
+            modeled_kv_token_capacity=0,
+            theoretical_raw_kv_token_capacity=0,
             target_max_model_len=target_max_model_len,
+            fits_per_invocation_target=False,
+            fits_cumulative_heuristic=False,
+            fits_qwen_128k_recommendation=False,
             max_num_seqs=max_num_seqs,
             fits=False,
             reason=(
@@ -393,29 +465,41 @@ def evaluate_instance(
             ),
         )
 
-    physical_tokens = int(
+    modeled_tokens = int(
         (paged_kv_pool_gib * GIB) // model.effective_kv_bytes_per_token
     )
-    # Round to vLLM's 16-token block size.
-    physical_tokens = (physical_tokens // 16) * 16
-    fits = physical_tokens >= target_max_model_len
+    modeled_tokens = (modeled_tokens // 16) * 16
+
+    raw_tokens = int(
+        (paged_kv_pool_gib * GIB) // model.full_attention_kv_bytes_per_token
+    )
+    raw_tokens = (raw_tokens // 16) * 16
+
+    fits = modeled_tokens >= target_max_model_len
+    fits_per_inv = modeled_tokens >= per_invocation_target
+    fits_cum = modeled_tokens >= cumulative_heuristic_target
+    fits_128k = modeled_tokens >= model.recommended_complex_task_context
+
     if fits:
-        concurrency_at_peak = physical_tokens / max(1, target_max_model_len)
+        ratio = modeled_tokens / max(1, target_max_model_len)
         reason = (
-            f"fits: {total_cache_pool_gib:.2f} GiB cache pool -> "
-            f"{physical_tokens:,} physical token capacity "
-            f"({concurrency_at_peak:.1f}x target max-model-len {target_max_model_len:,})"
+            f"fits target ({target_max_model_len:,}): {paged_kv_pool_gib:.2f} GiB paged KV budget -> "
+            f"~{modeled_tokens:,} modeled tokens ({ratio:.2f}x target; "
+            f"98K cumulative heuristic: {'YES' if fits_cum else 'NO'}, "
+            f"128K Qwen rec: {'YES' if fits_128k else 'NO'})"
         )
     else:
         reason = (
-            f"KV capacity ({physical_tokens:,} tokens) is below target "
-            f"max-model-len ({target_max_model_len:,} tokens)"
+            f"modeled capacity (~{modeled_tokens:,} tokens in {paged_kv_pool_gib:.2f} GiB paged KV) "
+            f"is below target max-model-len ({target_max_model_len:,} tokens)"
         )
 
     return InstanceEvaluation(
         instance=instance.name,
         gpu_model=instance.gpu_model,
         vram_gib=instance.vram_gib,
+        nominal_marketing_gb=instance.nominal_marketing_gb,
+        aws_spec_gib=instance.aws_spec_gib,
         usable_vram_gib=round(usable_vram_gib, 2),
         weights_gib=model.weights_gib,
         vision_overhead_gib=vision_overhead_gib,
@@ -423,8 +507,12 @@ def evaluate_instance(
         total_cache_pool_gib=round(total_cache_pool_gib, 2),
         deltanet_state_pool_gib=round(deltanet_state_pool_gib, 2),
         paged_kv_pool_gib=round(paged_kv_pool_gib, 2),
-        physical_kv_token_capacity=physical_tokens,
+        modeled_kv_token_capacity=modeled_tokens,
+        theoretical_raw_kv_token_capacity=raw_tokens,
         target_max_model_len=target_max_model_len,
+        fits_per_invocation_target=fits_per_inv,
+        fits_cumulative_heuristic=fits_cum,
+        fits_qwen_128k_recommendation=fits_128k,
         max_num_seqs=max_num_seqs,
         fits=fits,
         reason=reason,
@@ -437,26 +525,48 @@ def build_sizing_report(
     baseline: WorkloadBaseline | None = None,
     gpu_memory_utilization: float = 0.95,
     language_model_only: bool = True,
+    l40s_vram_gib: float = 44.99,
+    sizing_mode: str = "per-invocation",
 ) -> dict:
-    """Build the full structured sizing report for a model and workload baseline."""
+    """Build the structured sizing report for a model, GPU reading, and sizing mode."""
     if model_key not in MODELS:
         raise KeyError(f"Unknown model {model_key!r}; choose from {sorted(MODELS)}")
     model = MODELS[model_key]
     wb = baseline or WorkloadBaseline()
-    target_max_model_len = wb.recommended_max_model_len(
+
+    per_invocation_target = wb.per_invocation_segmented_max_model_len(
         native_limit=model.native_max_position_embeddings,
     )
+    cumulative_heuristic_target = wb.cumulative_heuristic_max_model_len(
+        native_limit=model.native_max_position_embeddings,
+    )
+    qwen_128k_target = model.recommended_complex_task_context
 
+    if sizing_mode == "per-invocation":
+        target_max_model_len = per_invocation_target
+    elif sizing_mode == "cumulative-2x":
+        target_max_model_len = cumulative_heuristic_target
+    elif sizing_mode == "qwen-128k":
+        target_max_model_len = qwen_128k_target
+    else:
+        raise ValueError(
+            f"Unknown sizing_mode {sizing_mode!r}; choose from "
+            "('per-invocation', 'cumulative-2x', 'qwen-128k')"
+        )
+
+    instances = build_instances(l40s_vram_gib=l40s_vram_gib)
     evaluations = [
         evaluate_instance(
             model,
             inst,
             target_max_model_len=target_max_model_len,
+            per_invocation_target=per_invocation_target,
+            cumulative_heuristic_target=cumulative_heuristic_target,
             max_num_seqs=wb.target_concurrency,
             gpu_memory_utilization=gpu_memory_utilization,
             language_model_only=language_model_only,
         )
-        for inst in INSTANCES
+        for inst in instances
     ]
     recommended = next((ev for ev in evaluations if ev.fits), None)
 
@@ -480,6 +590,9 @@ def build_sizing_report(
             "full_attention_kv_kib_per_token": round(
                 model.full_attention_kv_bytes_per_token / KIB, 2
             ),
+            "effective_hybrid_kv_kib_per_token": round(
+                model.effective_kv_bytes_per_token / KIB, 2
+            ),
             "deltanet_state_mib_per_sequence": round(
                 model.deltanet_state_bytes_per_sequence / MIB, 2
             ),
@@ -492,7 +605,12 @@ def build_sizing_report(
             "peak_run_corrected_total_tokens": wb.peak_run_corrected_total_tokens,
         },
         "sizing": {
+            "sizing_mode": sizing_mode,
+            "l40s_vram_gib": l40s_vram_gib,
             "target_max_model_len": target_max_model_len,
+            "per_invocation_segmented_target": per_invocation_target,
+            "cumulative_heuristic_target": cumulative_heuristic_target,
+            "qwen_complex_task_recommended_target": qwen_128k_target,
             "target_max_num_seqs": wb.target_concurrency,
             "gpu_memory_utilization": gpu_memory_utilization,
             "language_model_only": language_model_only,
@@ -508,18 +626,20 @@ def format_report(report: dict) -> str:
     b = report["baseline"]
     s = report["sizing"]
     lines = [
-        f"=== Hybrid KV-Cache & Instance Sizing: {m['repo_id']} ===",
+        f"=== Hybrid KV-Cache & Instance Sizing (Planning Estimate): {m['repo_id']} ===",
         f"Revision:   {m['revision']}",
         f"Precision:  {m['precision']}",
-        f"Weights:    {m['weights_gib']:.1f} GiB  |  Native context: {m['native_max_position_embeddings']:,} tokens",
+        f"Weights:    {m['weights_gib']:.2f} GiB  |  Native context: {m['native_max_position_embeddings']:,} tokens",
         "",
         "1. Architecture memory profile",
         f"   Layers:                {m['total_layers']} total = "
         f"{m['linear_attention_layers']} Gated DeltaNet (linear) + "
         f"{m['full_attention_layers']} full-attention (GQA)",
-        f"   Full-attention KV:     {m['full_attention_kv_kib_per_token']:.1f} KiB / token "
+        f"   Full-attention KV:     {m['full_attention_kv_kib_per_token']:.1f} KiB / token theoretical "
         f"(2 * {m['full_attention_layers']} layers * {m['kv_heads']} KV heads * "
         f"{m['head_dim']} dim * {m['kv_dtype_bytes']} B)",
+        f"   Hybrid-page effective: {m['effective_hybrid_kv_kib_per_token']:.2f} KiB / token "
+        f"(provisional {m['hybrid_page_overhead_factor']:.4f}x calibration; reconcile with vLLM startup logs)",
         f"   DeltaNet recurrent:    {m['deltanet_state_mib_per_sequence']:.2f} MiB / active sequence "
         f"(independent of context length; scales with --max-num-seqs)",
         f"   At --max-num-seqs {s['target_max_num_seqs']:<3d}: "
@@ -529,30 +649,37 @@ def format_report(report: dict) -> str:
         f"   Tool-calling runs:     {b['tool_calling_runs']}/{b['runs_measured']} "
         f"({b['tool_call_run_rate'] * 100:.0f}%)  |  {b['total_tool_calls']} tool calls "
         f"({b['tool_calls_per_run_avg']:.1f}/run overall, {b['tool_calls_per_tool_run_avg']:.1f}/tool-using run)",
-        f"   Input tokens (no-tool):{b['no_tool_input_tokens_avg']:>8,} avg  "
-        f"({b['no_tool_cache_hit_rate'] * 100:.1f}% prompt-cached)",
-        f"   Input tokens (tools):  {b['tool_run_input_tokens_avg']:>8,} avg  "
-        f"({b['tool_run_cache_hit_rate'] * 100:.1f}% prompt-cached; ~4.0x no-tool baseline)",
-        f"   Input tokens (artifact):{b['artifact_run_input_tokens_avg']:>7,} avg  "
-        f"(vs {b['non_artifact_tool_run_input_tokens_avg']:,} on other tool-using runs)",
-        f"   Peak measured run:     {b['peak_run_input_tokens']:>8,} input tokens + "
+        f"   Cumulative input avg:  {b['no_tool_input_tokens_avg']:>8,} (no-tool, {b['no_tool_cache_hit_rate'] * 100:.1f}% cached)  |  "
+        f"{b['tool_run_input_tokens_avg']:,} (tool-using, {b['tool_run_cache_hit_rate'] * 100:.1f}% cached)",
+        f"   Peak run (R11) total:  {b['peak_run_input_tokens']:>8,} cumulative input + "
         f"{b['peak_run_metered_output_tokens']:,} metered output + "
-        f"~{b['unmetered_artifact_output_tokens_peak']:,} artifact collaborator tokens "
-        f"= {b['peak_run_corrected_total_tokens']:,} total",
-        f"   Target --max-model-len:{s['target_max_model_len']:>8,} tokens "
-        f"({b['headroom_multiplier']:.1f}x peak run, aligned to {TOKEN_ALIGNMENT:,}-token boundary; "
-        f"{s['target_max_model_len'] / m['native_max_position_embeddings'] * 100:.1f}% of native 262K)",
+        f"~{b['unmetered_artifact_output_tokens_peak']:,} artifact collaborator output "
+        f"= {b['peak_run_corrected_total_tokens']:,} cumulative tokens",
+        f"   Peak single-call est:  ~{b['peak_single_invocation_tokens_est']:>7,} resident tokens on one invocation "
+        f"(R11 spans ~{b['peak_run_invocations_est']} model calls; 92.8% of cumulative input is cached prefix)",
         "",
-        "3. Instance evaluation",
+        "3. Candidate context targets vs. single-L40S physical memory "
+        f"({s['l40s_vram_gib']:.2f} GiB device / ~44 GiB AWS G6e spec / 48 GB marketing)",
+        f"   * per-invocation ({s['per_invocation_segmented_target']:>7,} tokens): "
+        "~3.0x peak single-call residency for segmented agent workflows",
+        f"   * cumulative-2x  ({s['cumulative_heuristic_target']:>7,} tokens): "
+        "provisional 2.0x cumulative run total (overstates single-call residency; exceeds 1x L40S at 44.99 GiB)",
+        f"   * qwen-128k      ({s['qwen_complex_task_recommended_target']:>7,} tokens): "
+        "Qwen model-card recommendation for complex unsegmented tasks (requires multi-GPU or KV quantization)",
+        f"   Active sizing mode:    {s['sizing_mode']} -> target --max-model-len {s['target_max_model_len']:,}",
+        "",
+        "4. Modeled instance evaluation (provisional planning estimates, not measured vLLM limits)",
     ]
     for ev in report["instances"]:
         verdict = "FIT " if ev["fits"] else "FAIL"
         lines.append(
-            f"   [{verdict}] {ev['instance']:<12} ({ev['gpu_model']}, {ev['vram_gib']:.0f} GiB VRAM) -> {ev['reason']}"
+            f"   [{verdict}] {ev['instance']:<12} ({ev['gpu_model']}, {ev['vram_gib']:.2f} GiB physical / "
+            f"{ev['aws_spec_gib']:.0f} GiB spec / {ev['nominal_marketing_gb']} GB nominal) -> {ev['reason']}"
         )
     lines.extend([
         "",
-        f"4. Recommended configuration (instance: {s['recommended_instance'] or 'none'})",
+        f"5. Recommended configuration for mode '{s['sizing_mode']}' "
+        f"(instance: {s['recommended_instance'] or 'none'})",
         "   " + " \\\n     ".join(s["vllm_flags"]),
     ])
     return "\n".join(lines)
@@ -569,6 +696,25 @@ def main(argv: list[str] | None = None) -> int:
         help="Model checkpoint profile to size (default: qwen3.6-35b-a3b-fp8).",
     )
     parser.add_argument(
+        "--sizing-mode",
+        choices=("per-invocation", "cumulative-2x", "qwen-128k"),
+        default="per-invocation",
+        help=(
+            "Context target mode: 'per-invocation' (49,152 segmented single-call target), "
+            "'cumulative-2x' (98,304 provisional cumulative-run heuristic), or "
+            "'qwen-128k' (131,072 Qwen complex-task recommendation)."
+        ),
+    )
+    parser.add_argument(
+        "--l40s-vram-gib",
+        type=float,
+        default=44.99,
+        help=(
+            "Physical L40S GPU memory in GiB (default: 44.99 physical device reading; "
+            "use 44.0 for AWS G6e spec or 48.0 to reproduce the unadjusted nominal estimate)."
+        ),
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=16,
@@ -578,13 +724,13 @@ def main(argv: list[str] | None = None) -> int:
         "--peak-input-tokens",
         type=int,
         default=47_305,
-        help="Peak input tokens observed in a single run (default: 47305 from R11).",
+        help="Peak cumulative input tokens observed in a single run (default: 47305 from R11).",
     )
     parser.add_argument(
         "--headroom",
         type=float,
         default=2.0,
-        help="Headroom multiplier above peak single-run tokens (default: 2.0).",
+        help="Headroom multiplier for cumulative-2x mode (default: 2.0).",
     )
     parser.add_argument(
         "--gpu-memory-utilization",
@@ -600,7 +746,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--json",
         action="store_true",
-        help="Emit structured JSON instead of the human-readable table.",
+        help="Emit structured JSON instead of the human-readable report.",
     )
     args = parser.parse_args(argv)
 
@@ -614,6 +760,8 @@ def main(argv: list[str] | None = None) -> int:
         baseline=baseline,
         gpu_memory_utilization=args.gpu_memory_utilization,
         language_model_only=not args.include_vision_tower,
+        l40s_vram_gib=args.l40s_vram_gib,
+        sizing_mode=args.sizing_mode,
     )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))

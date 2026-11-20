@@ -54,16 +54,25 @@ spec:
               containerPort: 8000
           env:
             - name: MAX_MODEL_LEN
-              # Set from physical hybrid KV capacity (~108,768 tokens in the
-              # 8.33 GiB remaining on a 48 GB L40S after loading
-              # Qwen3.6-35B-A3B-FP8 with --language-model-only and
-              # --max-num-seqs 16) and our measured workload baseline (peak
-              # run 47.3K input tokens, 2x headroom = 98,304). See
-              # docs/kv-cache-sizing.md and scripts/size_kv_cache.py.
-              value: "98304"
+              # Conservative single-L40S per-invocation limit (49,152 = 48 Ki).
+              # An L40S is marketed at 48 GB, listed at ~44 GiB in AWS G6e specs,
+              # and reports ~44.99 GiB physical device memory (~42.74 GiB at
+              # 0.95 utilization). After ~35.0 GiB FP8 weights, ~2.27 GiB
+              # workspace, and ~0.96 GiB DeltaNet recurrent state (16 slots),
+              # ~4.51 GiB remains for paged KV (~66,544 modeled tokens under our
+              # provisional hybrid-page calibration).
+              #
+              # 49,152 fits inside that ~66.5K modeled ceiling and covers ~3x
+              # our peak single-invocation resident context (~15.8K tokens on
+              # R11), whereas the 98,304 cumulative-run heuristic and Qwen's
+              # 131,072 complex-task recommendation exceed a single L40S under
+              # these assumptions. Reconcile with preserved vLLM startup logs
+              # before raising. See docs/kv-cache-sizing.md and
+              # scripts/size_kv_cache.py.
+              value: "49152"
             - name: GPU_MEMORY_UTILIZATION
-              # Leaves ~2.4 GiB headroom on a 48 GB L40S so a burst of long
-              # tool-calling prompts does not OOM the worker.
+              # Leaves ~2.25 GiB headroom on a 44.99 GiB physical L40S so a
+              # burst of long tool-calling prompts does not OOM the worker.
               value: "0.95"
             - name: PYTORCH_CUDA_ALLOC_CONF
               value: "expandable_segments:True"
@@ -76,7 +85,7 @@ spec:
               # profiling cache (~8 GiB VRAM) for text serving. Because 30 of
               # the model's 40 layers are Gated DeltaNet, vLLM pre-allocates
               # recurrent state blocks per concurrent sequence (--max-num-seqs);
-              # capping --max-num-seqs 16 keeps recurrent state to ~1 GiB so
+              # capping --max-num-seqs 16 keeps recurrent state to ~0.96 GiB so
               # the remaining pool goes to paged KV blocks.
               value: "--language-model-only --max-num-seqs 16 --max-num-batched-tokens 2048 --enforce-eager"
           resources:

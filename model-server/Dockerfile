@@ -13,11 +13,12 @@
 #     a mutable ref does not.
 #
 # Serving target (v0.2): Qwen/Qwen3.6-35B-A3B-FP8 (~35 GiB weights) on a
-# single g6e.2xlarge (1x NVIDIA L40S, 48 GB VRAM).
+# single g6e.2xlarge (1x NVIDIA L40S: 48 GB marketing, ~44 GiB AWS G6e spec,
+# ~44.99 GiB physical device reading).
 # The BF16 base checkpoint (Qwen/Qwen3.6-35B-A3B, ~71.9 GB / ~67 GiB) is kept
 # in object storage as the governed fine-tuning base; it does not fit on a
-# single 24 GB A10G (g5.xlarge) or 48 GB L40S (g6e.2xlarge), so the FP8
-# checkpoint is what we bake and serve.
+# single A10G (g5.xlarge) or L40S (g6e.2xlarge), so the FP8 checkpoint is what
+# we bake and serve.
 
 # ---------------------------------------------------------------------------
 # Stage 1 - fetch the checkpoint.
@@ -104,15 +105,18 @@ ENV TOOL_CALL_PARSER=qwen3_coder
 
 EXPOSE 8000
 
-# Flag notes for Qwen3.6-35B-A3B-FP8 on a single 48 GB L40S (g6e.2xlarge):
+# Flag notes for Qwen3.6-35B-A3B-FP8 on a single L40S (g6e.2xlarge, ~44.99 GiB
+# physical VRAM / ~44 GiB AWS G6e spec):
 #   * --trust-remote-code and --reasoning-parser qwen3: required for the
 #     Qwen3.6 MoE architecture and thinking traces.
-#   * --enable-auto-tool-choice --tool-call-parser qwen3_coder: required by
-#     the Qwen3.6 recipe so tool calls return structured tool_calls objects
-#     instead of raw XML/text in the completion body.
-#   * --max-model-len: sized from workload baseline + physical KV budget (see
-#     docs/kv-cache-sizing.md and scripts/size_kv_cache.py). If MAX_MODEL_LEN
-#     is set, pass it; otherwise let EXTRA_VLLM_ARGS or vLLM's config govern.
+#   * --enable-auto-tool-choice --tool-call-parser qwen3_coder: follows Qwen's
+#     vLLM serving recipe so tool calls return structured tool_calls objects.
+#     NOTE: In vLLM 0.19, related Qwen3.5/3.6 models have a reported edge case
+#     where tool calls emitted inside a reasoning block may not be extracted
+#     cleanly; validate streaming and non-streaming tool extraction against your
+#     own tool schemas before routing un-flagged production traffic.
+#   * --max-model-len: sized from per-invocation workload residency + physical
+#     KV budget (see docs/kv-cache-sizing.md and scripts/size_kv_cache.py).
 #   * --no-enable-log-requests: replaces --disable-log-requests (removed in
 #     vLLM v0.19). Prompts and completions are governed customer content and
 #     must never echo into pod stdout.

@@ -8,10 +8,12 @@ Terraform to stand up the cluster underneath it.
 This is a working reference, not a product. It's the sanitized, genericized
 shape of infrastructure built for a real teaching-assistant agent (ChatLPO /
 Lautum) under the **AWS Startups Custom-Model Inference Fellowship**, extracted
-to be useful on its own. See the companion series (*"Before Our First Token:
-Building Inference That's Safe to Turn On"* and *"First Token, Not First
-Teacher"*) for the reasoning behind these choices, the baseline measurements
-that drove the `v0.2` changes, and what is still in progress.
+to be useful on its own.
+
+**Companion series:**
+1. [“Plan My Whole Year”: The Request That Made Us Build Our Own Model](https://medium.com/@lyndon.carlson/plan-my-whole-year-the-request-that-made-us-build-our-own-model-18d82c57751a)
+2. [Before Our First Token: Building Inference That's Safe to Turn On](https://medium.com/@lyndon.carlson/before-our-first-token-building-inference-thats-safe-to-turn-on-dfa3d7df6a40)
+3. *The Agent Is the Workload: Sizing Qwen3.6 for Real Agent Tasks*
 
 ```
 caller ──▶ [internal NLB] ──▶ inference gateway ──▶ vLLM model server (GPU, scale-to-zero)
@@ -28,28 +30,35 @@ caller ──▶ [internal NLB] ──▶ inference gateway ──▶ vLLM model
      (the Qwen3.6 recipe requires `vLLM >= 0.17.0` for
      `Qwen3_5MoeForConditionalGeneration`).
    - Targets `Qwen/Qwen3.6-35B-A3B-FP8` (`~35 GiB` weights, pinned SHA
-     `c653bba46dfa06e9658dcc0b0dc87fe4685f14a2`) on a single 48 GB NVIDIA L40S
-     (`g6e.2xlarge`), replacing the `v0.1` 8B placeholder on 24 GB `g5.xlarge`.
-   - Adds `--enable-auto-tool-choice --tool-call-parser qwen3_coder` (82% of
-     our baseline teacher runs make tool calls), `--reasoning-parser qwen3`,
-     `--language-model-only` (reclaiming ~8 GiB of multimodal vision encoder
-     VRAM on text workloads), `--no-enable-log-requests`, and raises
-     `MAX_MODEL_LEN` from the legacy `8192` hard cap to `98304` (inside the
-     `108,768`-token physical KV capacity on one L40S at `--max-num-seqs 16`).
-2. **Rewritten [`docs/kv-cache-sizing.md`](docs/kv-cache-sizing.md) for hybrid Gated DeltaNet + GQA**:
-   - Replaces the `v0.1` dense-attention sizing note with the actual memory
-     math for `Qwen3.6-35B-A3B`, where **30 of 40 layers are Gated DeltaNet**
-     (`linear_attention`, fixed `61.41 MiB` recurrent state per concurrent
-     sequence regardless of context length) and only **10 of 40 layers** use
-     standard per-token GQA KV cache (`20 KiB/token`).
-   - Explains why concurrency (`--max-num-seqs`) is now as binding a VRAM
-     constraint as `--max-model-len`.
-3. **Baseline-driven sizing script ([`scripts/size_kv_cache.py`](scripts/size_kv_cache.py))**:
-   - Feeds our sanitized 11-run test-environment baseline (47.3K peak input
-     tokens, 91% prompt-cache hit rate on tool-using runs, 82% tool-calling
-     runs, and the `write_artifact` collaborator output adjustment) into the
-     hybrid KV + DeltaNet memory model to set `--max-model-len`,
-     `--max-num-seqs`, and the GPU instance shape.
+     `c653bba46dfa06e9658dcc0b0dc87fe4685f14a2`) on an NVIDIA L40S
+     (`g6e.2xlarge`: 48 GB marketing, ~44 GiB AWS G6e spec, `~44.99 GiB`
+     physical device reading), replacing the `v0.1` 8B placeholder on
+     `g5.xlarge`.
+   - Adds `--enable-auto-tool-choice --tool-call-parser qwen3_coder`,
+     `--reasoning-parser qwen3`, `--language-model-only` (skipping the
+     multimodal vision encoder on text workloads), `--no-enable-log-requests`,
+     and `--max-num-seqs 16`, with a conservative single-L40S default
+     `MAX_MODEL_LEN=49152` (`48 Ki`) sized for per-invocation residency inside
+     the `~66,544`-token modeled capacity at `44.99 GiB` physical GPU memory.
+2. **Rewritten [`docs/kv-cache-sizing.md`](docs/kv-cache-sizing.md) for hybrid Gated DeltaNet + GQA and physical GPU memory**:
+   - Replaces the `v0.1` dense-attention sizing note with the two-part memory
+     model for `Qwen3.6-35B-A3B`, where **30 of 40 layers are Gated DeltaNet**
+     (`linear_attention`, fixed `61.41 MiB` recurrent state per active sequence
+     regardless of context length) and **10 of 40 layers** use per-token GQA KV
+     cache (`20.0 KiB/token` theoretical).
+   - Shows the impact of using physical L40S memory (`44.99 GiB` device reading /
+     ~44 GiB AWS G6e spec) rather than `48.0 GiB` (`4.51 GiB` remaining paged KV
+     budget &rarr; `~66,544` modeled tokens vs. `7.37 GiB` &rarr; `~108,768`),
+     distinguishes **cumulative multi-call agent tokens** (`49,391` on peak run
+     `R11`) from **single-invocation resident context** (`~11.1K–15.8K`), and
+     evaluates Qwen's `>=128K` complex-task context recommendation against
+     segmented single-L40S workflows.
+3. **Baseline-driven sizing utility ([`scripts/size_kv_cache.py`](scripts/size_kv_cache.py))**:
+   - Evaluates three sizing modes (`per-invocation` `49,152`, `cumulative-2x`
+     `98,304`, and `qwen-128k` `131,072`) against physical GPU memory
+     (`--l40s-vram-gib 44.99` by default, configurable to `44.0` or `48.0`),
+     clearly labeling outputs as provisional planning estimates until reconciled
+     with preserved vLLM startup profiles.
 4. **OpenAI Responses API (`/v1/responses`) passthrough and metering**
    ([`gateway/app/main.py`](gateway/app/main.py),
    [`gateway/app/meter.py`](gateway/app/meter.py)):
@@ -103,8 +112,12 @@ instead of reaching a model server at all.
 ## Quickstart (no GPU needed)
 
 ```bash
-# Run the hybrid KV-cache & instance sizer against the baseline:
+# Run the hybrid KV-cache & instance sizer (defaults to 44.99 GiB physical L40S):
 python scripts/size_kv_cache.py
+
+# Compare per-invocation (49,152) vs. cumulative-2x (98,304) or Qwen 128K (131,072):
+python scripts/size_kv_cache.py --sizing-mode cumulative-2x
+python scripts/size_kv_cache.py --sizing-mode qwen-128k
 
 cd gateway
 python -m venv .venv && .venv/bin/pip install -e ".[dev]"
@@ -113,14 +126,14 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 # refuses to boot if auth is required but no key is set.
 GATEWAY_REQUIRE_AUTH=false .venv/bin/uvicorn app.main:app --port 8080
 
-.venv/bin/pytest -q   # 58 tests, no GPU or network needed
+.venv/bin/pytest -q   # 60 tests, no GPU or network needed
 ```
 
 ## Deploying the whole stack
 
 1. **Terraform** (`terraform/`): stand up the EKS cluster, the two node
    pools (`system` for the gateway, `gpu-inference` on `g6e.xlarge` /
-   `g6e.2xlarge` L40S 48 GB for vLLM, scale-to-zero by default), IRSA roles,
+   `g6e.2xlarge` L40S for vLLM, scale-to-zero by default), IRSA roles,
    and the AWS Load Balancer Controller. Point `terraform.tfvars` (copy
    `terraform.tfvars.example`) at your own VPC and subnets.
 2. **Build the model-server image** (`model-server/Dockerfile`): pass a
@@ -145,6 +158,21 @@ This starter kit is an open-source reference implementation, not a finished
 production inference platform. Several key areas remain active engineering work
 and are intentionally documented as unfinished:
 
+- **Reconciling modeled KV capacity with physical vLLM startup profiles:**
+  `scripts/size_kv_cache.py` uses `44.99 GiB` physical L40S memory (~44 GiB in
+  AWS G6e specs) and a provisional `3.5526x` hybrid-cache overhead factor,
+  yielding `~66,544` modeled tokens on one L40S at `--max-num-seqs 16`. That
+  supports our `49,152`-token per-invocation segmented target, but does not fit
+  the `98,304` cumulative-run heuristic or Qwen's `131,072` (128K) complex-task
+  recommendation on a single GPU. These planning estimates must be reconciled
+  with preserved vLLM startup profiles (`# GPU blocks` and actual weight/workspace
+  allocations) on the deployed hardware.
+- **Structured and streaming tool-call validation under reasoning mode:**
+  The model server uses `--reasoning-parser qwen3 --enable-auto-tool-choice --tool-call-parser qwen3_coder`.
+  Because vLLM 0.19 has a reported edge case in the `Qwen3.5`/`3.6` family where
+  tool calls inside a reasoning block may not be extracted cleanly, application
+  traffic remains behind a feature flag while multi-step and streaming tool
+  calls are validated end to end.
 - **Request-driven activation from zero (0 &rarr; 1):**
   When vLLM has zero running replicas, it cannot emit metrics or report its own
   queue depth (`vllm:num_requests_waiting`). While scaling 1 &rarr; N and scaling
@@ -159,18 +187,17 @@ and are intentionally documented as unfinished:
   response. The gateway's Kubernetes readiness probe must remain decoupled from
   upstream model state.
 - **Application fallback and cold-start timing under production load:**
-  The gateway returns clean `503` warming responses with `Retry-After: 30`, and
-  `Qwen/Qwen3.6-35B-A3B-FP8` is validated on `g6e.2xlarge` (48 GB L40S) with
-  `vLLM v0.19.0`, but automated scale-up from zero, end-to-end fallback to
-  managed models during GPU cold starts, and systematic cold-start latency
-  benchmarks across instance types remain active work.
+  The gateway returns clean `503` warming responses with `Retry-After: 30`, but
+  automated scale-up from zero, end-to-end fallback to managed models during GPU
+  cold starts, and systematic cold-start latency benchmarks remain active work.
 
 ## What's deliberately out of scope
 
 - **Multi-node / multi-GPU serving.** Everything here targets one GPU per
-  model-server replica (`1x NVIDIA L40S` 48 GB for `Qwen3.6-35B-A3B-FP8`).
-  Disaggregated prefill/decode and EFA for cross-node inference are real
-  techniques for larger unquantized models, but add real operational overhead.
+  model-server replica (`1x NVIDIA L40S` for `Qwen3.6-35B-A3B-FP8`).
+  Disaggregated prefill/decode and multi-GPU tensor parallelism are needed if
+  benchmark results show that unsegmented 128K+ contexts outperform segmented
+  48K–64K workflows.
 - **LoRA adapter serving and Ray Serve orchestration.** vLLM supports multiple
   adapters on a shared base model (`--enable-lora --max-loras`), and Ray Serve
   can manage multiple model copies across Karpenter-provisioned nodes; neither
@@ -183,11 +210,11 @@ and are intentionally documented as unfinished:
 ## Further reading
 
 - [`docs/kv-cache-sizing.md`](docs/kv-cache-sizing.md) -- why our `v0.1`
-  standard-attention sizing doc was wrong for `Qwen3.6-35B-A3B`'s 30 Gated
-  DeltaNet layers, and how concurrency (`--max-num-seqs`) and our baseline
-  numbers set `MAX_MODEL_LEN=98304` on a 48 GB L40S.
+  standard-attention sizing doc was wrong for `Qwen3.6-35B-A3B`, how `44.99 GiB`
+  physical L40S memory changes the paged KV budget (`~66,544` modeled tokens),
+  and how cumulative run tokens differ from per-invocation resident context.
 - [`scripts/size_kv_cache.py`](scripts/size_kv_cache.py) -- the standalone
-  sizing script fed by our test-environment baseline.
+  sizing utility fed by our test-environment baseline.
 - [`docs/decisions.md`](docs/decisions.md) -- the short version of why each
   non-obvious default in this repo is set the way it is.
 - [`k8s/autoscaling/README.md`](k8s/autoscaling/README.md) -- how the

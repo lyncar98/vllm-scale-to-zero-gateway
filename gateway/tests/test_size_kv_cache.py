@@ -26,26 +26,60 @@ def test_qwen3_8b_reference_matches_dense_formula():
     assert model.deltanet_state_bytes_per_sequence == 0
 
 
-def test_baseline_derives_98304_max_model_len_and_picks_g6e_2xlarge():
+def test_physical_44_99_gib_l40s_yields_66544_modeled_tokens_and_fits_per_invocation_target():
     report = size_kv_cache.build_sizing_report()
     assert report["baseline"]["tool_call_run_rate"] == 0.818
     assert report["baseline"]["peak_run_input_tokens"] == 47_305
-    assert report["sizing"]["target_max_model_len"] == 98_304
+    assert report["sizing"]["l40s_vram_gib"] == 44.99
+    assert report["sizing"]["per_invocation_segmented_target"] == 49_152
+    assert report["sizing"]["cumulative_heuristic_target"] == 98_304
+    assert report["sizing"]["qwen_complex_task_recommended_target"] == 131_072
+    assert report["sizing"]["target_max_model_len"] == 49_152
     assert report["sizing"]["recommended_instance"] == "g6e.2xlarge"
 
     by_name = {inst["instance"]: inst for inst in report["instances"]}
     assert not by_name["g5.xlarge"]["fits"]
-    assert by_name["g6e.2xlarge"]["fits"]
-    assert by_name["g6e.2xlarge"]["physical_kv_token_capacity"] == 108_768
+
+    l40s = by_name["g6e.2xlarge"]
+    assert l40s["usable_vram_gib"] == 42.74
+    assert l40s["paged_kv_pool_gib"] == 4.51
+    assert l40s["modeled_kv_token_capacity"] == 66_544
+    assert l40s["fits"] is True
+    assert l40s["fits_per_invocation_target"] is True
+    # Under 44.99 GiB physical L40S memory, the 98,304 cumulative-run heuristic
+    # and Qwen's 131,072 complex-task recommendation do NOT fit on 1x L40S.
+    assert l40s["fits_cumulative_heuristic"] is False
+    assert l40s["fits_qwen_128k_recommendation"] is False
+
+
+def test_cumulative_2x_heuristic_98304_does_not_fit_single_44_99_gib_l40s():
+    report = size_kv_cache.build_sizing_report(sizing_mode="cumulative-2x")
+    assert report["sizing"]["target_max_model_len"] == 98_304
+    by_name = {inst["instance"]: inst for inst in report["instances"]}
+    assert not by_name["g6e.2xlarge"]["fits"]
+    assert by_name["g6e.12xlarge"]["fits"]
+    assert report["sizing"]["recommended_instance"] == "g6e.12xlarge"
+
+
+def test_unadjusted_48_gib_nominal_input_reproduces_108k_comparison():
+    report = size_kv_cache.build_sizing_report(
+        l40s_vram_gib=48.0,
+        sizing_mode="cumulative-2x",
+    )
+    by_name = {inst["instance"]: inst for inst in report["instances"]}
+    l40s = by_name["g6e.2xlarge"]
+    assert l40s["usable_vram_gib"] == 45.60
+    assert l40s["total_cache_pool_gib"] == 8.33
+    assert l40s["paged_kv_pool_gib"] == 7.37
+    assert l40s["modeled_kv_token_capacity"] in (108_752, 108_768)
+    assert l40s["fits"] is True
 
 
 def test_omitting_language_model_only_or_leaving_default_256_seqs_breaks_single_l40s():
-    # Without --language-model-only, the ~8 GiB vision encoder profiling cache eats the KV budget.
     with_vision = size_kv_cache.build_sizing_report(language_model_only=False)
     by_name_vision = {inst["instance"]: inst for inst in with_vision["instances"]}
     assert not by_name_vision["g6e.2xlarge"]["fits"]
 
-    # With vLLM's default --max-num-seqs 256, 30 DeltaNet layers demand ~15.35 GiB of recurrent state alone.
     high_seqs = size_kv_cache.build_sizing_report(
         baseline=size_kv_cache.WorkloadBaseline(target_concurrency=256),
     )
@@ -66,4 +100,5 @@ def test_cli_json_output_is_valid(capsys):
     assert rc == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["sizing"]["recommended_instance"] == "g6e.2xlarge"
+    assert doc["sizing"]["target_max_model_len"] == 49_152
     assert "--tool-call-parser qwen3_coder" in doc["sizing"]["vllm_flags"]
